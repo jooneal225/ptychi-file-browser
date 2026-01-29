@@ -437,22 +437,30 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         elif extension in ('dp_sum.tiff', 'init_probe_mag.tiff'):
             self.file_load_path = file_path.parent / extension
         else:
-            self.file_load_path = file_path.parent / (extension.split('.')[0][:-3] + '%d.%s' %(int(file_path.stem.split('Niter')[1]), extension.split('.')[1]))
+            base = extension.rsplit("Niter", 1)[0]
+            suffix = file_path.stem.split("recon_", 1)[1]
+            self.file_load_path = file_path.parent / f"{base}{suffix}{Path(extension).suffix}"
+            # self.file_load_path = file_path.parent / (extension.split('.')[0][:-3] + '%d.%s' %(int(file_path.stem.split('Niter')[1]), extension.split('.')[1]))
 
-        if self.file_load_path.suffix in ('.h5', 'hdf5'):
+        if self.file_load_path.suffix in ('.h5', '.hdf5'):
             with h5py.File(self.file_load_path, 'r') as f:
                 obj = np.angle(f['object'][0][()])
                 self.res_m = float(f['obj_pixel_size_m'][()])
 
                 
-        if self.file_load_path.suffix in ('.tiff', 'tiff'):
+        if self.file_load_path.suffix in ('.tiff',):
             with tifffile.TiffFile(self.file_load_path) as tif:
                 obj = tif.asarray()
-                self.res_m = 1e-6 * tif.imagej_metadata['pixel_size']
+                if 'pixel_size' in tif.imagej_metadata.keys():
+                    self.res_m = 1e-6 * tif.imagej_metadata['pixel_size']
+                    
+                elif 'xspacing' in tif.imagej_metadata.keys():
+                    self.res_m = 1e-6 * tif.imagej_metadata['xspacing']
+
                 if len(obj.shape) == 3:
                     obj = np.mean(obj, 2).T
 
-        if self.file_load_path.suffix in ('.png', 'png'):
+        if self.file_load_path.suffix in ('.png',):
             obj = Image.open(self.file_load_path).convert("L")  # L = grayscale
             obj = np.array(obj, dtype=np.float32).T
 
