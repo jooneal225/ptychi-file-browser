@@ -134,9 +134,6 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         reanalyze_file = scan_path / "scan_should_be_reanalyzed.txt"
         bad_file = scan_path / "scan_is_bad.txt"
 
-        print('hi')
-        print(self.radioButton_good.isChecked())
-
         if self.radioButton_good.isChecked():
             self.scan_goodness = 'good'
             good_file.write_text("good\n")
