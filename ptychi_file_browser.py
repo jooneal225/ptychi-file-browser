@@ -48,9 +48,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.on_base_path_entered()
 
         self.treeWidget_fileStructure.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.treeWidget_fileStructure.customContextMenuRequested.connect(
-            self.on_tree_right_click
-        )
+        self.treeWidget_fileStructure.customContextMenuRequested.connect(self.on_tree_right_click)
 
 
 
@@ -216,14 +214,20 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             self.scan_watcher.stop()
             self.scan_watcher.wait()
 
-        self.scan_watcher = ScanWatcherThread(self.base_path, 
-                                              seen_scans=self._seen_scans,
-                                              seen_param_folders=self._seen_param_folders,
-                                              seen_recon_files=self._seen_recon_files)
+        # self.scan_watcher = ScanWatcherThread(self.base_path, 
+        #                                       seen_scans=self._seen_scans,
+        #                                       seen_param_folders=self._seen_param_folders,
+        #                                       seen_recon_files=self._seen_recon_files)
+        # self.scan_watcher.scan_found.connect(self.on_scan_found)
+        # self.scan_watcher.param_folder_found.connect(self.on_param_folder_found)
+        # self.scan_watcher.recon_file_found.connect(self.on_recon_file_found)
+        # self.scan_watcher.start()
+        
+        self.scan_watcher = ScanWatcherThread(Path(self.base_path), poll_interval=2.0)
         self.scan_watcher.scan_found.connect(self.on_scan_found)
-        self.scan_watcher.param_folder_found.connect(self.on_param_folder_found)
-        self.scan_watcher.recon_file_found.connect(self.on_recon_file_found)
+        self.scan_watcher.finished_adding_scans.connect(self.on_finished_adding_scans)
         self.scan_watcher.start()
+
 
         self._set_scan_watcher_ui('running')
 
@@ -231,6 +235,12 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     def on_scan_found(self, scan_path: Path):
         print(f"New scan detected: {scan_path.name}")
         self._add_scan_row(scan_path)
+
+        
+    def on_finished_adding_scans(self):
+        self.treeWidget_fileStructure.setSortingEnabled(True)
+        self.treeWidget_fileStructure.sortByColumn(0, Qt.AscendingOrder)
+        self.treeWidget_fileStructure.setSortingEnabled(False)
 
 
     def on_param_folder_found(self, param_path: Path):
