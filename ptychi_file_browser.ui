@@ -1,17 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
- <class>MainWindow</class>
- <widget class="QMainWindow" name="MainWindow">
+ <class>mainWindow</class>
+ <widget class="QMainWindow" name="mainWindow">
   <property name="geometry">
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>1186</width>
+    <width>1204</width>
     <height>741</height>
    </rect>
   </property>
   <property name="windowTitle">
-   <string>MainWindow</string>
+   <string>Ptychi File Browser</string>
   </property>
   <widget class="QWidget" name="centralwidget">
    <layout class="QGridLayout" name="gridLayout">
@@ -172,6 +172,21 @@
       <item>
        <layout class="QHBoxLayout" name="horizontalLayout_3">
         <item>
+         <widget class="QToolButton" name="toolButton_tips">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
+          <property name="toolTip">
+           <string>List all features</string>
+          </property>
+          <property name="text">
+           <string>Tips</string>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="QComboBox" name="comboBox_imageChoice">
           <property name="sizePolicy">
            <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
@@ -229,6 +244,18 @@
             <string>init_probe_mag.tiff</string>
            </property>
           </item>
+         </widget>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="checkBox_transpose">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
+          <property name="text">
+           <string>Transpose</string>
+          </property>
          </widget>
         </item>
         <item>
@@ -326,7 +353,7 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>1186</width>
+     <width>1204</width>
      <height>26</height>
     </rect>
    </property>

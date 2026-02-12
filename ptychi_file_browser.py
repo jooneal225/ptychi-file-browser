@@ -13,8 +13,9 @@ from scan_watcher_thread import ScanWatcherThread
 import pyqtgraph as pg
 from PyQt5 import QtWidgets, uic
 from PyQt5.QtWidgets import QApplication, QLabel
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSettings, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QColor, QBrush
+
 
 
 class PtychiReconBrowser(QtWidgets.QMainWindow):
@@ -37,20 +38,26 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.scan_goodness = 'unknown'
         self.file_load_path = None
 
-        self._scan_row_items = {}     # scan_name -> QTreeWidgetItem
-        self._seen_scans = set()      # just scan names
-        self._seen_param_folders = {} # scan_name -> set(param_folder_paths)
-        self._seen_recon_files = {}   # scan_name -> {param_folder_path -> set(recon_file_paths)}
+        self.treeWidget_fileStructure.installEventFilter(self)
 
+        self._initialize_empty_data_containers()
         self._set_scan_watcher_ui('gray')
         self._setup_tree()
         self._connect_signals()
         self._setup_pyqtgraph_view()
+        self.restore_window_size()
+        self.load_base_path()
         self.on_base_path_entered()
 
         self.treeWidget_fileStructure.setContextMenuPolicy(Qt.CustomContextMenu)
         self.treeWidget_fileStructure.customContextMenuRequested.connect(self.on_tree_right_click)
 
+
+    def _initialize_empty_data_containers(self):
+        self._scan_row_items = {}     # scan_name -> QTreeWidgetItem
+        self._seen_scans = set()      # just scan names
+        self._seen_param_folders = {} # scan_name -> set(param_folder_paths)
+        self._seen_recon_files = {}   # scan_name -> {param_folder_path -> set(recon_file_paths)}
 
 
     def _setup_tree(self):
@@ -81,6 +88,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.treeWidget_fileStructure.currentItemChanged.connect(self.on_tree_selection_changed)
         self.pushButton_stopScanUpdate.clicked.connect(self.on_stop_scan_update)
         self.pushButton_updateScanGoodness.clicked.connect(self.on_update_scan_goodness)
+        self.toolButton_tips.clicked.connect(self.show_secret_features)
 
 
     def _setup_pyqtgraph_view(self):
@@ -110,6 +118,82 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         tree_row.setText(tree_idx, folder_in.name)
         tree_row.setData(tree_idx, Qt.UserRole, folder_in)
         tree_row.setData(tree_idx, Qt.ToolTipRole, folder_in.name)
+
+
+    def save_base_path(self):
+        settings = QSettings("temp", "PtychiFileBrowser")
+        settings.setValue("last_base_path", str(self.base_path))
+
+
+    def load_base_path(self):
+        settings = QSettings("temp", "PtychiFileBrowser")
+        last_path = settings.value("last_base_path", defaultValue="/mnt/micdata2/")
+        if last_path:
+            self.lineEdit_basePath.setText(last_path)
+            
+        
+    def restore_window_size(self):
+        settings = QSettings("temp", "PtychiFileBrowser")
+
+        geom = settings.value("window_geometry")
+        if geom is not None:
+            self.restoreGeometry(geom)
+
+        state = settings.value("window_state")
+        if state is not None:
+            self.restoreState(state)
+
+
+    def show_secret_features(self):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Hidden Features")
+
+        layout = QtWidgets.QVBoxLayout(dlg)
+
+        edit = QtWidgets.QTextEdit()
+        edit.setReadOnly(True)
+        edit.setPlainText(f"""
+        Hidden Features / Shortcuts
+
+        Arrow Keys
+        --- Up / Down → switch scan number
+        --- Left / Right → switch recon file
+
+        Mouse
+        --- Right click column 0 → refresh scan
+        --- Right click column 1 → switch parameter folder
+        --- Right click column 2 → switch recon file
+
+        Scan goodness
+        --- Row color shows scan goodness, tracked as txt file in scan folder
+        --- Green is a good ptycho recon, yellow marks a scan to reanalyze, red is bad data
+        
+        Sample names
+        --- Pulled from file 'runtable_full_{self.base_path.parent.name}.csv'
+        --- File must be located in parent of base path
+        --- i.e. {self.base_path.parent}
+        --- Searches for scan number in column 'run', and returns corresponding string from 'sample_name'
+
+        Scan Auto Updater
+        --- Every 2.0 s, checks a file {self.base_path / "recon_completed.csv"}
+        --- Looks for new rows since last check, in the form S0001, i.e. four-digit run number
+        --- Refreshes every scan number it finds
+        --- Code to add to ptychi reconstruction script just after ptychi handles the reconstruction:
+        import csv
+        # append row to log file
+        with open(os.path.join(data_main_dir, 'ptychi_recons', 'recon_completed.csv'), "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["S%04d" % scan_num])
+        """.strip())
+
+        layout.addWidget(edit)
+
+        btn = QtWidgets.QPushButton("Close")
+        btn.clicked.connect(dlg.accept)
+        layout.addWidget(btn)
+
+        dlg.resize(700, 400)
+        dlg.exec()
 
 
     # ------------------------------------------------------------------
@@ -272,10 +356,15 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
 
     def closeEvent(self, event):
+        settings = QSettings("temp", "PtychiFileBrowser")
+
+        settings.setValue("window_geometry", self.saveGeometry())
+        settings.setValue("window_state", self.saveState())
+
         if getattr(self, "scan_watcher", None) is not None:
             self.scan_watcher.stop()
             self.scan_watcher.wait()
-            self._set_scan_watcher_ui('gray')
+
         event.accept()
 
 
@@ -460,7 +549,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         if self.file_load_path.suffix in ('.h5', '.hdf5'):
             with h5py.File(self.file_load_path, 'r') as f:
-                obj = np.angle(f['object'][0][()])
+                obj = np.angle(f['object'][0][()]).T
                 self.res_m = float(f['obj_pixel_size_m'][()])
 
                 
@@ -475,6 +564,9 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
                 if len(obj.shape) == 3:
                     obj = np.mean(obj, 2).T
+
+                if 'object_' in self.file_load_path.stem:
+                    obj = obj.T
 
         if self.file_load_path.suffix in ('.png',):
             obj = Image.open(self.file_load_path).convert("L")  # L = grayscale
@@ -515,13 +607,14 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
 
         # Convert to float32 for pyqtgraph
-        data = data.astype(np.float32)
+        data = data.astype(np.float32).T if self.checkBox_transpose.isChecked() else data.astype(np.float32)
 
         # Display
         if self.checkBox_logCmap.isChecked():
             self.pg_view.setImage(np.log10(np.clip(np.abs(data), a_min=np.finfo(float).eps, a_max=None)), autoLevels=True)
 
-        self.pg_view.setImage(data, autoLevels=True)
+        else:
+            self.pg_view.setImage(data, autoLevels=True)
 
         # Enable colorbar
         if not hasattr(self, "_colorbar_added"):
@@ -638,6 +731,58 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.add_to_tree(row_item, 2, recon_file)
 
 
+    def _switch_recon_with_arrows(self, item, key):
+        scan_name = item.text(0)
+
+        param_path = item.data(1, Qt.UserRole)
+        current_recon = item.data(2, Qt.UserRole)
+
+        if not isinstance(param_path, Path) or not isinstance(current_recon, Path):
+            return
+
+        recon_list = sorted(
+            self._seen_recon_files[scan_name][param_path.name],
+            key=self._recon_sort_key
+        )
+
+        if not recon_list:
+            return
+
+        try:
+            idx = recon_list.index(current_recon)
+        except ValueError:
+            return
+
+        if key == Qt.Key_Right:
+            new_idx = min(idx + 1, len(recon_list) - 1)
+        else:  # left
+            new_idx = max(idx - 1, 0)
+
+        if new_idx == idx:
+            return
+
+        new_recon = recon_list[new_idx]
+
+        # reuse your existing switch logic
+        self._switch_recon_file(item, new_recon)
+
+
+    def eventFilter(self, obj, event):
+        if obj is self.treeWidget_fileStructure and event.type() == QEvent.KeyPress:
+
+            if event.key() in (Qt.Key_Left, Qt.Key_Right):
+
+                item = self.treeWidget_fileStructure.currentItem()
+                if item is None:
+                    return False
+
+                self._switch_recon_with_arrows(item, event.key())
+                self.on_tree_item_clicked(item, 2)
+                return True  # handled → stop default behavior
+
+        return super().eventFilter(obj, event)
+
+
     # ------------------------------------------------------------------
     # scan tree
     # ------------------------------------------------------------------
@@ -658,6 +803,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         """
         Depth-first population of the tree.
         """
+        self._initialize_empty_data_containers()
         self.treeWidget_fileStructure.clear()
 
         if self.base_path is None:
@@ -840,6 +986,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.runtable_df = self.load_runtable()
 
         self._set_scan_watcher_ui('gray')
+        self.save_base_path()
+
         return True
     
 
