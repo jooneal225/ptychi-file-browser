@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>1153</width>
-    <height>724</height>
+    <width>1186</width>
+    <height>741</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -33,6 +33,11 @@
        <layout class="QHBoxLayout" name="horizontalLayout">
         <item>
          <widget class="QLabel" name="label_basePath">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="text">
            <string>Base Path:</string>
           </property>
@@ -40,6 +45,11 @@
         </item>
         <item>
          <widget class="QLineEdit" name="lineEdit_basePath">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="text">
            <string>Z:\12IDC\2025_Dec\ptychi_recons</string>
           </property>
@@ -47,6 +57,11 @@
         </item>
         <item>
          <widget class="QPushButton" name="pushButton_browseBasePath">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="text">
            <string>Browse...</string>
           </property>
@@ -54,6 +69,11 @@
         </item>
         <item>
          <widget class="QPushButton" name="pushButton_populateTree">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="text">
            <string>Populate tree</string>
           </property>
@@ -61,6 +81,11 @@
         </item>
         <item>
          <widget class="QPushButton" name="pushButton_stopScanUpdate">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="text">
            <string>Stop Updates</string>
           </property>
@@ -72,6 +97,11 @@
        <layout class="QHBoxLayout" name="horizontalLayout_2" stretch="3,5">
         <item>
          <widget class="QTreeWidget" name="treeWidget_fileStructure">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="columnCount">
            <number>4</number>
           </property>
@@ -107,6 +137,11 @@
               <verstretch>0</verstretch>
              </sizepolicy>
             </property>
+            <property name="font">
+             <font>
+              <pointsize>10</pointsize>
+             </font>
+            </property>
             <property name="text">
              <string>scan, sample_name</string>
             </property>
@@ -123,6 +158,11 @@
               <verstretch>0</verstretch>
              </sizepolicy>
             </property>
+            <property name="font">
+             <font>
+              <pointsize>10</pointsize>
+             </font>
+            </property>
            </widget>
           </item>
          </layout>
@@ -138,6 +178,11 @@
             <horstretch>0</horstretch>
             <verstretch>0</verstretch>
            </sizepolicy>
+          </property>
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
           </property>
           <item>
            <property name="text">
@@ -188,6 +233,11 @@
         </item>
         <item>
          <widget class="QCheckBox" name="checkBox_logCmap">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="text">
            <string>Log Colorscale</string>
           </property>
@@ -195,6 +245,11 @@
         </item>
         <item>
          <widget class="QPushButton" name="pushButton_updateScanGoodness">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="text">
            <string>Update Scan Goodness</string>
           </property>
@@ -202,6 +257,11 @@
         </item>
         <item>
          <widget class="QRadioButton" name="radioButton_good">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="text">
            <string>Good</string>
           </property>
@@ -212,6 +272,11 @@
         </item>
         <item>
          <widget class="QRadioButton" name="radioButton_reanalyze">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="text">
            <string>Reanalyze</string>
           </property>
@@ -222,6 +287,11 @@
         </item>
         <item>
          <widget class="QRadioButton" name="radioButton_bad">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="text">
            <string>Bad</string>
           </property>
@@ -232,6 +302,11 @@
         </item>
         <item>
          <widget class="QRadioButton" name="radioButton_unknown">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
           <property name="text">
            <string>Unknown</string>
           </property>
@@ -251,7 +326,7 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>1153</width>
+     <width>1186</width>
      <height>26</height>
     </rect>
    </property>

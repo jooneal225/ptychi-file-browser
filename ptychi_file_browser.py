@@ -12,6 +12,7 @@ from scan_watcher_thread import ScanWatcherThread
 
 import pyqtgraph as pg
 from PyQt5 import QtWidgets, uic
+from PyQt5.QtWidgets import QApplication, QLabel
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QImage, QPixmap, QColor, QBrush
 
@@ -63,9 +64,12 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         # Set initial column widths (pixels)
         self.treeWidget_fileStructure.setColumnWidth(0, 50)  # Scan column
-        self.treeWidget_fileStructure.setColumnWidth(1, 75)  # Param folder
+        self.treeWidget_fileStructure.setColumnWidth(1, 85)  # Param folder
         self.treeWidget_fileStructure.setColumnWidth(2, 50)  # Recon file
         self.treeWidget_fileStructure.setColumnWidth(3, 100)  # Sample name
+
+        # header = self.treeWidget_fileStructure.header()
+        # header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
 
 
     def _connect_signals(self):
@@ -231,7 +235,12 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         
     def on_scan_found(self, scan_path: Path):
         print(f"New scan detected: {scan_path.name}")
-        self._add_scan_row(scan_path)
+
+        if scan_path.name in self._scan_row_items:
+            self._refresh_scan_row(scan_path)   # existing → update in place
+        else:
+            self._add_scan_row(scan_path)       # new → add row
+
 
         
     def on_finished_adding_scans(self):
@@ -479,6 +488,20 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     # plotting
     # ------------------------------------------------------------------
 
+    def set_plot_label(self, scan: str, sample_name: str, file_path: str):
+        full_text = f"{scan}, {sample_name}\n{file_path}"
+
+        # Elide long lines
+        elide_width = 500  # pixels, adjust to fit your layout
+        metrics = self.label_plot_1.fontMetrics()
+        lines = full_text.split("\n")
+        elided_lines = [metrics.elidedText(line, Qt.ElideMiddle, elide_width) for line in lines]
+        elided_text = "\n".join(elided_lines)
+
+        self.label_plot_1.setText(elided_text)
+        self.label_plot_1.setToolTip(full_text)
+
+
     def display_data(self, data: np.ndarray, scan: int, sample_name: str):
         """
         Display a 2D numpy array using pyqtgraph.
@@ -487,7 +510,9 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             raise ValueError("display_data expects a 2D numpy array")
 
         # Update title label
-        self.label_plot_1.setText("%s, %s\n%s" % (scan, sample_name, self.file_load_path))
+        # self.label_plot_1.setText("%s, %s\n%s" % (scan, sample_name, self.file_load_path))
+        self.set_plot_label(scan, sample_name, str(self.file_load_path))
+
 
         # Convert to float32 for pyqtgraph
         data = data.astype(np.float32)
@@ -510,12 +535,12 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             # Determine the column you want to act on; e.g., column 2 for recon file
             self.on_tree_item_clicked(current, 2)
 
-
     
     def on_tree_item_clicked(self, item, column):
         """
         Handle clicks anywhere on a scan row.
         """
+    
         # Try recon file first
         file_path = item.data(2, Qt.UserRole)
 
@@ -540,10 +565,17 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         column = index.column()
         scan_name = item.text(0)
 
-        if column not in (1, 2):
+        if column not in (0, 1, 2):
             return
 
         menu = QtWidgets.QMenu()
+
+        if column == 0:
+            # trigger an update of the file scan
+            action = menu.addAction("Refresh scan")
+            action.triggered.connect(
+                lambda checked, p=(self.base_path / scan_name): self._refresh_scan_row(p)
+            )
 
         if column == 1:  # column 1 stores param folder
             # Add all param folders for this scan to the menu
@@ -556,13 +588,25 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             param_name = item.text(1)
 
             # Add all param folders for this scan to the menu
-            for recon_file in sorted(self._seen_recon_files[scan_name][param_name]):
+            # for recon_file in sorted(self._seen_recon_files[scan_name][param_name]):
+            for recon_file in sorted(self._seen_recon_files[scan_name][param_name], key=self._recon_sort_key):
                 action = menu.addAction(recon_file.name)
                 # Use a lambda to capture recon_file
                 action.triggered.connect(lambda checked, r=recon_file, i=item: self._switch_recon_file(i, r))
 
         menu.exec_(self.treeWidget_fileStructure.viewport().mapToGlobal(pos))
         self.on_tree_item_clicked(item, 1)
+
+
+    def _recon_sort_key(self, p: Path):
+        name = p.stem
+
+        if "_idx" in name:
+            # recon_idx15_Niter20_60 → 15
+            return int(name.split("_idx")[1].split("_")[0])
+
+        # recon_Niter200 → 200
+        return int(name.split("Niter")[-1].split("_")[0])
 
 
     def _switch_param_folder(self, row_item, scan_name, param_path):
@@ -644,6 +688,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         self.treeWidget_fileStructure.resizeColumnToContents(0)
         self.treeWidget_fileStructure.resizeColumnToContents(2)
+        # self.treeWidget_fileStructure.setUpdatesEnabled(False)
         print(time.time() - t0, 's')
 
         self.start_scan_watcher()
@@ -662,7 +707,33 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         # Create the tree row
         row_item = QtWidgets.QTreeWidgetItem(self.treeWidget_fileStructure)
         self._scan_row_items[scan_path.name] = row_item
+        self._populate_scan_row(row_item, scan_path)
 
+
+    def _refresh_scan_row(self, scan_path: Path):
+        """
+        Replace an existing scan row with a fresh one, then sort the tree.
+        """
+        # Remove existing row if it exists
+        row_item = self._scan_row_items.pop(scan_path.name, None)
+        if row_item is not None:
+            index = self.treeWidget_fileStructure.indexOfTopLevelItem(row_item)
+            if index != -1:
+                self.treeWidget_fileStructure.takeTopLevelItem(index)
+
+        # Add a new row
+        self._add_scan_row(scan_path)
+
+        # Optionally sort by scan name (or keep your custom order)
+        self.treeWidget_fileStructure.sortItems(0, Qt.AscendingOrder)
+
+        # Make sure the new row is selected
+        row_item = self._scan_row_items.get(scan_path.name)
+        if row_item is not None:
+            self.treeWidget_fileStructure.setCurrentItem(row_item)
+
+
+    def _populate_scan_row(self, row_item: QtWidgets.QTreeWidgetItem, scan_path: Path):
         self.add_to_tree(row_item, 0, scan_path)
 
         # Initialize nested storage
