@@ -89,6 +89,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.pushButton_stopScanUpdate.clicked.connect(self.on_stop_scan_update)
         self.pushButton_updateScanGoodness.clicked.connect(self.on_update_scan_goodness)
         self.toolButton_tips.clicked.connect(self.show_secret_features)
+        self.pushButton_addScan.clicked.connect(self.on_add_scan_clicked)
 
 
     def _setup_pyqtgraph_view(self):
@@ -155,9 +156,10 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         edit.setPlainText(f"""
         Hidden Features / Shortcuts
 
-        Arrow Keys
-        --- Up / Down → switch scan number
+        Tree Navigation
+        --- Up / Down    → switch scan number
         --- Left / Right → switch recon file
+        --- , / .        → switch parameter folder
 
         Mouse
         --- Right click column 0 → refresh scan
@@ -194,6 +196,80 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         dlg.resize(700, 400)
         dlg.exec()
+
+
+    def on_add_scan_clicked(self):
+        """
+        Show a dialog with a combo box to add a new scan.
+        Suggests the next 10 scan numbers based on the maximum existing scan.
+        """
+        # Find the maximum scan number from _seen_scans
+        max_scan_num = 0
+        for scan_name in self._seen_scans:
+            # Extract number from S0001 format
+            if len(scan_name) == 5 and scan_name.startswith("S") and scan_name[1:].isdigit():
+                scan_num = int(scan_name[1:])
+                max_scan_num = max(max_scan_num, scan_num)
+        
+        # Create dialog
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Add Scan")
+        
+        layout = QtWidgets.QVBoxLayout(dlg)
+        
+        # Add label
+        label = QtWidgets.QLabel("Select or enter scan name:")
+        layout.addWidget(label)
+        
+        # Create editable combo box
+        combo = QtWidgets.QComboBox()
+        combo.setEditable(True)
+        
+        # Populate with suggested scan names (next 10 scans)
+        for idx in range(1, 11):
+            scan_name = f"S{max_scan_num + idx:04d}"
+            combo.addItem(scan_name)
+        
+        layout.addWidget(combo)
+        
+        # Add OK/Cancel buttons
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(dlg.accept)
+        button_box.rejected.connect(dlg.reject)
+        layout.addWidget(button_box)
+        
+        # Show dialog and get result
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            selected_scan = combo.currentText()
+            
+            # Validate format: S followed by 4 digits
+            if len(selected_scan) == 5 and selected_scan.startswith("S") and selected_scan[1:].isdigit():
+                # Create scan path
+                scan_path = self.base_path / selected_scan
+                
+                # Check if it exists
+                if scan_path.exists():
+                    # Add to tree
+                    self._add_scan_row(scan_path)
+                    print(f"Added scan: {selected_scan}")
+                else:
+                    # Show error message
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Scan Not Found",
+                        f"Scan folder does not exist:\n{scan_path}"
+                    )
+            else:
+                # Show format error
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Invalid Format",
+                    f"Invalid scan name format: {selected_scan}\nExpected format: S#### (e.g., S0042)"
+                )
+        
+        return None
 
 
     # ------------------------------------------------------------------
@@ -537,10 +613,18 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         data : 2d numpy array
         """
         extension = self.comboBox_imageChoice.currentText()
+
         if extension == 'recon_NiterXXX.h5':
             self.file_load_path = file_path
+
         elif extension in ('dp_sum.tiff', 'init_probe_mag.tiff'):
             self.file_load_path = file_path.parent / extension
+
+        elif extension == 'init_positions.png':
+            self.file_load_path = file_path.parent / extension
+            obj = Image.open(self.file_load_path).convert("L")  # L = grayscale
+            obj = np.array(obj, dtype=np.float32).T
+
         else:
             base = extension.rsplit("Niter", 1)[0]
             suffix = file_path.stem.split("recon_", 1)[1]
@@ -552,8 +636,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                 obj = np.angle(f['object'][0][()]).T
                 self.res_m = float(f['obj_pixel_size_m'][()])
 
-                
-        if self.file_load_path.suffix in ('.tiff',):
+        elif self.file_load_path.suffix in ('.tiff',):
             with tifffile.TiffFile(self.file_load_path) as tif:
                 obj = tif.asarray()
                 if 'pixel_size' in tif.imagej_metadata.keys():
@@ -568,7 +651,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                 if 'object_' in self.file_load_path.stem:
                     obj = obj.T
 
-        if self.file_load_path.suffix in ('.png',):
+        elif self.file_load_path.suffix in ('.png',):
             obj = Image.open(self.file_load_path).convert("L")  # L = grayscale
             obj = np.array(obj, dtype=np.float32).T
 
@@ -670,7 +753,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                 lambda checked, p=(self.base_path / scan_name): self._refresh_scan_row(p)
             )
 
-        if column == 1:  # column 1 stores param folder
+        elif column == 1:  # column 1 stores param folder
             # Add all param folders for this scan to the menu
             for param_path in sorted(self._seen_param_folders[scan_name]):
                 action = menu.addAction(param_path.name)
@@ -767,18 +850,58 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._switch_recon_file(item, new_recon)
 
 
+    def _switch_param_folder_with_keys(self, item, key):
+        scan_name = item.text(0)
+        current_param = item.data(1, Qt.UserRole)
+        
+        if not isinstance(current_param, Path):
+            return
+        
+        # Get sorted list of param folders for this scan
+        param_list = sorted(self._seen_param_folders[scan_name])
+        
+        if not param_list:
+            return
+        
+        try:
+            idx = param_list.index(current_param)
+        except ValueError:
+            return
+        
+        if key == Qt.Key_Period:  # . key goes forward
+            new_idx = min(idx + 1, len(param_list) - 1)
+        else:  # Qt.Key_Comma goes backward
+            new_idx = max(idx - 1, 0)
+        
+        if new_idx == idx:
+            return
+        
+        new_param = param_list[new_idx]
+        
+        # Reuse existing switch logic
+        self._switch_param_folder(item, scan_name, new_param)
+
+
     def eventFilter(self, obj, event):
         if obj is self.treeWidget_fileStructure and event.type() == QEvent.KeyPress:
 
-            if event.key() in (Qt.Key_Left, Qt.Key_Right):
+            if event.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Comma, Qt.Key_Period):
 
                 item = self.treeWidget_fileStructure.currentItem()
                 if item is None:
                     return False
 
-                self._switch_recon_with_arrows(item, event.key())
-                self.on_tree_item_clicked(item, 2)
-                return True  # handled → stop default behavior
+                # Handle left/right arrow keys for recon files (column 2)
+                if event.key() in (Qt.Key_Left, Qt.Key_Right):
+                    self._switch_recon_with_arrows(item, event.key())
+                    self.on_tree_item_clicked(item, 2)
+                    return True  # handled → stop default behavior
+                
+                # Handle comma/period keys for param folders (column 1)
+                elif event.key() in (Qt.Key_Comma, Qt.Key_Period):
+                    self._switch_param_folder_with_keys(item, event.key())
+                    self.on_tree_item_clicked(item, 1)
+                    return True  # handled → stop default behavior
 
         return super().eventFilter(obj, event)
 
