@@ -7,6 +7,7 @@ import h5py
 import tifffile
 from PIL import Image
 import time
+from scipy.ndimage import map_coordinates
 
 from scan_watcher_thread import ScanWatcherThread
 
@@ -14,7 +15,7 @@ import pyqtgraph as pg
 from PyQt5 import QtWidgets, uic
 from PyQt5.QtWidgets import QApplication, QLabel
 from PyQt5.QtCore import Qt, QSettings, QEvent
-from PyQt5.QtGui import QImage, QPixmap, QColor, QBrush
+from PyQt5.QtGui import QImage, QPixmap, QColor, QBrush, QFont
 
 
 
@@ -28,7 +29,6 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         # ---- Basic UI setup ----
         # self.graphics_scene = QtWidgets.QGraphicsScene(self)
         # self.graphicsView_1.setScene(self.graphics_scene)
-
 
         self.base_path: Path | None = None
         self.viewChoice = ''
@@ -97,9 +97,169 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         Embed pyqtgraph ImageView into the placeholder widget.
         """
         self.pg_view = pg.ImageView()
+
+        # Lineout plot (hidden by default, lives in a splitter below the image)
+        self._lineout_visible = False
+        self._lineout_plot = pg.PlotWidget()
+        self._lineout_plot.setLabel('bottom', 'Distance (µm)')
+        self._lineout_plot.setLabel('left', 'Value')
+        self._lineout_plot.setVisible(False)
+
+        splitter = QtWidgets.QSplitter(Qt.Vertical)
+        splitter.addWidget(self.pg_view)
+        splitter.addWidget(self._lineout_plot)
+        splitter.setSizes([700, 200])
+
         self.graphicsView_1_layout = QtWidgets.QVBoxLayout(self.graphicsView_1)
         self.graphicsView_1_layout.setContentsMargins(0, 0, 0, 0)
-        self.graphicsView_1_layout.addWidget(self.pg_view)
+        self.graphicsView_1_layout.addWidget(splitter)
+
+        # --- Measurement overlay ---
+        self._measure_clicks = []  # up to 2 (x, y) pixel-space coords
+
+        self._measure_scatter = pg.ScatterPlotItem(
+            size=12, pen=pg.mkPen('r', width=2), brush=pg.mkBrush(None), symbol='+'
+        )
+        self.pg_view.getView().addItem(self._measure_scatter)
+
+        self._measure_line = pg.PlotCurveItem(
+            pen=pg.mkPen('r', width=1, style=Qt.DashLine)
+        )
+        self.pg_view.getView().addItem(self._measure_line)
+
+        self._distance_text = pg.TextItem(
+            color=(0, 0, 0), anchor=(0.5, 0.5),
+            fill=pg.mkBrush(255, 255, 255, 220),
+        )
+        _font = QFont()
+        _font.setPointSize(10)
+        self._distance_text.textItem.setFont(_font)
+        self.pg_view.getView().addItem(self._distance_text)
+        self._distance_text.setVisible(False)
+
+        # Positions overlay (for _pos choice)
+        self._positions_scatter_overlay = pg.ScatterPlotItem(
+            size=8, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 180)
+        )
+        self._positions_scatter_overlay.setVisible(False)
+        self.pg_view.getView().addItem(self._positions_scatter_overlay)
+
+        # "Plot Lineout" toggle in the ViewBox right-click menu
+        self._lineout_action = QtWidgets.QAction("Plot Lineout")
+        self._lineout_action.setCheckable(True)
+        self._lineout_action.triggered.connect(self._toggle_lineout)
+        self.pg_view.getView().menu.addSeparator()
+        self.pg_view.getView().menu.addAction(self._lineout_action)
+
+        # --- Mouse signals ---
+        self._mouse_move_proxy = pg.SignalProxy(
+            self.pg_view.scene.sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved
+        )
+        self.pg_view.scene.sigMouseClicked.connect(self._on_mouse_clicked)
+
+
+    def _on_mouse_moved(self, event):
+        pos = event[0]  # SignalProxy wraps args in a tuple
+        img_item = self.pg_view.getImageItem()
+        if img_item is None or img_item.image is None:
+            return
+        base = getattr(self, '_info_base_text', '')
+        if img_item.sceneBoundingRect().contains(pos):
+            pt = img_item.mapFromScene(pos)
+            nx, ny = img_item.image.shape[:2]
+            x_um = (pt.x() - nx / 2) * self.res_m * 1e6
+            y_um = (pt.y() - ny / 2) * self.res_m * 1e6
+            xi, yi = int(pt.x()), int(pt.y())
+            if 0 <= xi < nx and 0 <= yi < ny:
+                intens = img_item.image[xi, yi]
+                self.label_plot_info.setText(f"{base}\nx={x_um:.2f}, y={y_um:.2f} µm, I={intens:.2g}")
+            else:
+                self.label_plot_info.setText(f"{base}\nx={x_um:.2f}, y={y_um:.2f} µm")
+        else:
+            self.label_plot_info.setText(base)
+
+
+    def _on_mouse_clicked(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        pos = event.scenePos()
+        img_item = self.pg_view.getImageItem()
+        if img_item is None or img_item.image is None:
+            return
+        if not img_item.sceneBoundingRect().contains(pos):
+            return
+
+        pt = img_item.mapFromScene(pos)
+        x, y = pt.x(), pt.y()
+
+        if len(self._measure_clicks) == 2:
+            # Third click: clear everything
+            self._measure_clicks = []
+            self._measure_scatter.setData(x=[], y=[])
+            self._measure_line.setData([], [])
+            self._distance_text.setVisible(False)
+            self._update_lineout()
+            return
+
+        self._measure_clicks.append((x, y))
+        self._measure_scatter.setData(
+            x=[p[0] for p in self._measure_clicks],
+            y=[p[1] for p in self._measure_clicks],
+        )
+
+        if len(self._measure_clicks) == 2:
+            x1, y1 = self._measure_clicks[0]
+            x2, y2 = self._measure_clicks[1]
+            dist_um = np.sqrt(
+                ((x2 - x1) * self.res_m * 1e6) ** 2 +
+                ((y2 - y1) * self.res_m * 1e6) ** 2
+            )
+            self._measure_line.setData([x1, x2], [y1, y2])
+            # Offset the label perpendicularly away from the line
+            dx, dy = x2 - x1, y2 - y1
+            seg_len = np.sqrt(dx**2 + dy**2)
+            offset = max(seg_len * 0.1, 45)  # 15% of line length, min 25 px
+            if seg_len > 0:
+                px, py = -dy / seg_len * offset, dx / seg_len * offset
+            else:
+                px, py = 0, offset
+            self._distance_text.setPos((x1 + x2) / 2 + px, (y1 + y2) / 2 + py)
+            self._distance_text.setText(f"{dist_um:.2f} µm")
+            self._distance_text.setVisible(True)
+            self._update_lineout()
+
+
+    def _toggle_lineout(self, checked: bool):
+        self._lineout_visible = checked
+        self._lineout_plot.setVisible(checked)
+        self._update_lineout()
+
+    def _update_lineout(self):
+        if not self._lineout_visible:
+            return
+        self._lineout_plot.clear()
+        if len(self._measure_clicks) < 2:
+            return
+        x1, y1 = self._measure_clicks[0]
+        x2, y2 = self._measure_clicks[1]
+        dist_um, values = self._compute_lineout(x1, y1, x2, y2)
+        if dist_um is not None:
+            self._lineout_plot.plot(dist_um, values, pen=pg.mkPen('w', width=1))
+            marker_pen = pg.mkPen('r', width=1, style=Qt.DashLine)
+            self._lineout_plot.addItem(pg.InfiniteLine(pos=dist_um[0],  angle=90, pen=marker_pen))
+            self._lineout_plot.addItem(pg.InfiniteLine(pos=dist_um[-1], angle=90, pen=marker_pen))
+
+    def _compute_lineout(self, x1, y1, x2, y2):
+        img = self.pg_view.getImageItem().image
+        if img is None:
+            return None, None
+        n_pts = max(int(np.hypot(x2 - x1, y2 - y1)), 10)
+        xs = np.linspace(x1, x2, n_pts)
+        ys = np.linspace(y1, y2, n_pts)
+        values = map_coordinates(img, [xs, ys], order=1, mode='nearest')
+        total_um = np.hypot((x2 - x1) * self.res_m * 1e6, (y2 - y1) * self.res_m * 1e6)
+        dist_um = np.linspace(0, total_um, n_pts)
+        return dist_um, values
 
 
     # ------------------------------------------------------------------
@@ -160,11 +320,13 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         --- Up / Down    → switch scan number
         --- Left / Right → switch recon file
         --- , / .        → switch parameter folder
-
-        Mouse
         --- Right click column 0 → refresh scan
         --- Right click column 1 → switch parameter folder
         --- Right click column 2 → switch recon file
+                          
+        Plot
+        --- Click on two points to get distance and lineout
+        --- Open lineout viewer with right-click on plot
 
         Scan goodness
         --- Row color shows scan goodness, tracked as txt file in scan folder
@@ -384,7 +546,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         # self.scan_watcher.recon_file_found.connect(self.on_recon_file_found)
         # self.scan_watcher.start()
         
-        self.scan_watcher = ScanWatcherThread(Path(self.base_path), poll_interval=2.0)
+        self.scan_watcher = ScanWatcherThread(Path(self.base_path), poll_interval=10.0)
         self.scan_watcher.scan_found.connect(self.on_scan_found)
         self.scan_watcher.finished_adding_scans.connect(self.on_finished_adding_scans)
         self.scan_watcher.start()
@@ -573,26 +735,43 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     def get_sample_name_for_scan(self, scan_path: Path):
         """
         Return sample name for a scan folder S#### if available.
+        Tries runtable first, then falls back to parsing a filename directly.
         """
-        if self.runtable_df is None:
-            return None
-
         try:
             scan_num = int(scan_path.name[1:])
         except ValueError:
             return None
 
-        if "run" not in self.runtable_df.columns:
-            return None
-        if "sample_name" not in self.runtable_df.columns:
+        # --- runtable lookup ---
+        if self.runtable_df is not None:
+            if "run" in self.runtable_df.columns and "sample_name" in self.runtable_df.columns:
+                match = self.runtable_df[self.runtable_df["run"] == scan_num]
+                if not match.empty:
+                    value = match.iloc[0]["sample_name"]
+                    if pd.notna(value):
+                        return str(value)
+
+        # --- filesystem fallback ---
+        base_dir = self.base_path.parent
+        run_dir = base_dir / f"ptycho/{scan_num:03d}"
+        if not run_dir.is_dir():
+            run_dir = base_dir / f"ptycho/S{scan_num:04d}"
+        if not run_dir.is_dir():
             return None
 
-        match = self.runtable_df[self.runtable_df["run"] == scan_num]
-        if match.empty:
+        hits = list(run_dir.glob("*00001.h5"))
+        if not hits:
             return None
 
-        value = match.iloc[0]["sample_name"]
-        return str(value) if pd.notna(value) else None
+        stem = hits[0].stem
+        parts = stem.split("_")
+        for i, p in enumerate(parts):
+            if p.endswith(f"{scan_num:03d}"):
+                sample_name = ("_".join(parts[:i]) + "_" + p[:-3]) if i > 0 else p[:-3]
+                print(sample_name)
+                return sample_name or None
+
+        return None
 
 
     # ------------------------------------------------------------------
@@ -613,35 +792,46 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         data : 2d numpy array
         """
         extension = self.comboBox_imageChoice.currentText()
+        self._positions_px = None  # reset on every load
 
         if extension == 'recon_NiterXXX.h5':
             self.file_load_path = file_path
+
+        elif extension in ('recon_NiterXXX_ph.h5', 'recon_NiterXXX_mag.h5', 'recon_NiterXXX_pos.h5'):
+            variant = extension[len('recon_NiterXXX'):]   # e.g. "_ph.h5"
+            self.file_load_path = file_path
+            # self.file_load_path = file_path.parent / f"{file_path.stem}{variant}"
 
         elif extension in ('dp_sum.tiff', 'init_probe_mag.tiff'):
             self.file_load_path = file_path.parent / extension
 
         elif extension == 'init_positions.png':
             self.file_load_path = file_path.parent / extension
-            obj = Image.open(self.file_load_path).convert("L")  # L = grayscale
-            obj = np.array(obj, dtype=np.float32).T
 
         else:
             base = extension.rsplit("Niter", 1)[0]
             suffix = file_path.stem.split("recon_", 1)[1]
             self.file_load_path = file_path.parent / f"{base}{suffix}{Path(extension).suffix}"
-            # self.file_load_path = file_path.parent / (extension.split('.')[0][:-3] + '%d.%s' %(int(file_path.stem.split('Niter')[1]), extension.split('.')[1]))
+
+        if not self.file_load_path.exists():
+            return None
 
         if self.file_load_path.suffix in ('.h5', '.hdf5'):
             with h5py.File(self.file_load_path, 'r') as f:
-                obj = np.angle(f['object'][0][()]).T
+                if extension == 'recon_NiterXXX_mag.h5':
+                    obj = np.abs(f['object'][0][()]).T
+                else:
+                    obj = np.angle(f['object'][0][()]).T
                 self.res_m = float(f['obj_pixel_size_m'][()])
+                if extension == 'recon_NiterXXX_pos.h5' and 'positions_px' in f:
+                    self._positions_px = f['positions_px'][()]
 
         elif self.file_load_path.suffix in ('.tiff',):
             with tifffile.TiffFile(self.file_load_path) as tif:
                 obj = tif.asarray()
                 if 'pixel_size' in tif.imagej_metadata.keys():
                     self.res_m = 1e-6 * tif.imagej_metadata['pixel_size']
-                    
+
                 elif 'xspacing' in tif.imagej_metadata.keys():
                     self.res_m = 1e-6 * tif.imagej_metadata['xspacing']
 
@@ -654,7 +844,6 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         elif self.file_load_path.suffix in ('.png',):
             obj = Image.open(self.file_load_path).convert("L")  # L = grayscale
             obj = np.array(obj, dtype=np.float32).T
-
 
         return obj
 
@@ -691,6 +880,19 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         # Convert to float32 for pyqtgraph
         data = data.astype(np.float32).T if self.checkBox_transpose.isChecked() else data.astype(np.float32)
+        self._displayed_shape = data.shape  # (nx, ny) in pyqtgraph convention
+
+        # Clear measurement overlay (pixel coords are image-specific)
+        self._measure_clicks = []
+        self._measure_scatter.setData(x=[], y=[])
+        self._measure_line.setData([], [])
+        self._distance_text.setVisible(False)
+        self._update_lineout()
+
+        # Update image info label
+        pix_size_nm = round(self.res_m * 1e9)
+        self._info_base_text = "%.2f\u00d7%.2f µm, %d nm pix" % (data.shape[0] * self.res_m * 1e6, data.shape[1] * self.res_m * 1e6, pix_size_nm)
+        self.label_plot_info.setText(self._info_base_text)
 
         # Display
         if self.checkBox_logCmap.isChecked():
@@ -717,18 +919,36 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         Handle clicks anywhere on a scan row.
         """
     
-        # Try recon file first
+        # Try recon file first; fall back to param folder (col 1) for non-recon choices
         file_path = item.data(2, Qt.UserRole)
 
         if not isinstance(file_path, Path):
-            return
+            param_path = item.data(1, Qt.UserRole)
+            if not isinstance(param_path, Path) or not param_path.exists():
+                return
+            # Synthetic path: parent = param_path; stem is irrelevant for tiff/png choices
+            file_path = param_path / "_"
 
         data = self.load_data_from_file(file_path)
         if data is None:
             return
 
         self.display_data(data, item.text(0), item.text(3))
+        self._update_positions_overlay()
         self.update_scan_goodness_ui(item.data(0, Qt.UserRole + 1))
+
+
+    def _update_positions_overlay(self):
+        """Show scan positions as a red scatter overlay (only for _pos choice)."""
+        pos = getattr(self, '_positions_px', None)
+        if pos is None or len(pos) == 0:
+            self._positions_scatter_overlay.setVisible(False)
+            return
+        # positions_px is (N, 2) in (row, col) = (y, x) convention stored as
+        # offsets from center; shift to image center in pyqtgraph (axis 0 = x, axis 1 = y)
+        nx, ny = getattr(self, '_displayed_shape', (0, 0))
+        self._positions_scatter_overlay.setData(x=pos[:, 1] + nx / 2, y=pos[:, 0] + ny / 2)
+        self._positions_scatter_overlay.setVisible(True)
 
 
     def on_tree_right_click(self, pos):
@@ -960,7 +1180,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         # self.treeWidget_fileStructure.setUpdatesEnabled(False)
         print(time.time() - t0, 's')
 
-        self.start_scan_watcher()
+        self._set_scan_watcher_ui('stopped')
 
 
     def _add_param_folder(self, scan_name: str, param_path: Path):
