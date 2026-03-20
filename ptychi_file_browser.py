@@ -151,6 +151,16 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.pg_view.getView().menu.addSeparator()
         self.pg_view.getView().menu.addAction(self._lineout_action)
 
+        # "Reset Zoom" action
+        self._reset_zoom_action = QtWidgets.QAction("Reset Zoom")
+        self._reset_zoom_action.triggered.connect(lambda: self.pg_view.getView().autoRange())
+        self.pg_view.getView().menu.addAction(self._reset_zoom_action)
+
+        # "Full Probe Zoom" toggle — when checked, skip the square crop zoom
+        self._full_probe_zoom_action = QtWidgets.QAction("Full Probe Zoom")
+        self._full_probe_zoom_action.setCheckable(True)
+        self.pg_view.getView().menu.addAction(self._full_probe_zoom_action)
+
         # --- Mouse signals ---
         self._mouse_move_proxy = pg.SignalProxy(
             self.pg_view.scene.sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved
@@ -315,11 +325,16 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         edit.setReadOnly(True)
         edit.setPlainText(f"""
         Hidden Features / Shortcuts
+                          
+        Populating
+        --- Set Base Path and click Populate tree to start
+        --- Populate tree is slow, so afterwards try to add each scan manually or use scan auto updater
 
         Tree Navigation
         --- Up / Down    → switch scan number
         --- Left / Right → switch recon file
         --- , / .        → switch parameter folder
+        --- k / l        → switch file type (for example: object_ph or probe_mag)
         --- Right click column 0 → refresh scan
         --- Right click column 1 → switch parameter folder
         --- Right click column 2 → switch recon file
@@ -327,6 +342,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         Plot
         --- Click on two points to get distance and lineout
         --- Open lineout viewer with right-click on plot
+        --- By default, probe viewer is centered on mode 0, and the right-click menu can turn this off
+        --- Right-click menu can reset zoom
 
         Scan goodness
         --- Row color shows scan goodness, tracked as txt file in scan folder
@@ -339,7 +356,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         --- Searches for scan number in column 'run', and returns corresponding string from 'sample_name'
 
         Scan Auto Updater
-        --- Every 2.0 s, checks a file {self.base_path / "recon_completed.csv"}
+        --- Every 10.0 s, checks a file {self.base_path / "recon_completed.csv"}
         --- Looks for new rows since last check, in the form S0001, i.e. four-digit run number
         --- Refreshes every scan number it finds
         --- Code to add to ptychi reconstruction script just after ptychi handles the reconstruction:
@@ -934,8 +951,24 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             return
 
         self.display_data(data, item.text(0), item.text(3))
+        self._apply_probe_zoom()
         self._update_positions_overlay()
         self.update_scan_goodness_ui(item.data(0, Qt.UserRole + 1))
+
+
+    def _apply_probe_zoom(self):
+        """For probe images (wide+short), zoom to the leftmost H×H square."""
+        if self._full_probe_zoom_action.isChecked():
+            return
+        extension = self.comboBox_imageChoice.currentText()
+        if extension != 'init_probe_mag.tiff' and not extension.startswith('probe_mag'):
+            return
+        shape = getattr(self, '_displayed_shape', None)
+        if shape is None:
+            return
+        ny = shape[1]  # vertical height H
+        # Leftmost square: x in [0, H], y in [0, H]
+        self.pg_view.getView().setRange(xRange=(0, ny), yRange=(0, ny), padding=0.05)
 
 
     def _update_positions_overlay(self):
@@ -1102,10 +1135,24 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._switch_param_folder(item, scan_name, new_param)
 
 
+    def _switch_image_choice_with_keys(self, key):
+        """K = move comboBox up one entry, L = move down one entry."""
+        n = self.comboBox_imageChoice.count()
+        if n == 0:
+            return
+        idx = self.comboBox_imageChoice.currentIndex()
+        if key == Qt.Key_K:
+            new_idx = max(idx - 1, 0)
+        else:  # Key_L
+            new_idx = min(idx + 1, n - 1)
+        if new_idx != idx:
+            self.comboBox_imageChoice.setCurrentIndex(new_idx)
+
+
     def eventFilter(self, obj, event):
         if obj is self.treeWidget_fileStructure and event.type() == QEvent.KeyPress:
 
-            if event.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Comma, Qt.Key_Period):
+            if event.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Comma, Qt.Key_Period, Qt.Key_K, Qt.Key_L):
 
                 item = self.treeWidget_fileStructure.currentItem()
                 if item is None:
@@ -1116,11 +1163,17 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                     self._switch_recon_with_arrows(item, event.key())
                     self.on_tree_item_clicked(item, 2)
                     return True  # handled → stop default behavior
-                
+
                 # Handle comma/period keys for param folders (column 1)
                 elif event.key() in (Qt.Key_Comma, Qt.Key_Period):
                     self._switch_param_folder_with_keys(item, event.key())
                     self.on_tree_item_clicked(item, 1)
+                    return True  # handled → stop default behavior
+
+                # Handle k/l keys for comboBox image choice
+                elif event.key() in (Qt.Key_K, Qt.Key_L):
+                    self._switch_image_choice_with_keys(event.key())
+                    self.on_tree_item_clicked(item, 2)
                     return True  # handled → stop default behavior
 
         return super().eventFilter(obj, event)
