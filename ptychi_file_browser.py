@@ -7,7 +7,7 @@ import h5py
 import tifffile
 from PIL import Image
 import time
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import map_coordinates, median_filter, gaussian_filter
 
 from scan_watcher_thread import ScanWatcherThread
 
@@ -144,6 +144,12 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._positions_scatter_overlay.setVisible(False)
         self.pg_view.getView().addItem(self._positions_scatter_overlay)
 
+        # "Copy param folder path" action
+        self._copy_param_path_action = QtWidgets.QAction("Copy Param Folder Path")
+        self._copy_param_path_action.triggered.connect(self._copy_current_param_path)
+        self.pg_view.getView().menu.addAction(self._copy_param_path_action)
+        self.pg_view.getView().menu.addSeparator()
+
         # "Plot Lineout" toggle in the ViewBox right-click menu
         self._lineout_action = QtWidgets.QAction("Plot Lineout")
         self._lineout_action.setCheckable(True)
@@ -156,10 +162,38 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._reset_zoom_action.triggered.connect(lambda: self.pg_view.getView().autoRange())
         self.pg_view.getView().menu.addAction(self._reset_zoom_action)
 
+        # "Auto-reset Zoom" toggle — when checked, zoom resets on every new image load
+        self._auto_reset_zoom_action = QtWidgets.QAction("Auto-reset Zoom")
+        self._auto_reset_zoom_action.setCheckable(True)
+        self._auto_reset_zoom_action.setChecked(True)
+        self.pg_view.getView().menu.addAction(self._auto_reset_zoom_action)
+
         # "Full Probe Zoom" toggle — when checked, skip the square crop zoom
         self._full_probe_zoom_action = QtWidgets.QAction("Full Probe Zoom")
         self._full_probe_zoom_action.setCheckable(True)
         self.pg_view.getView().menu.addAction(self._full_probe_zoom_action)
+
+        # "Analyze" submenu
+        self._active_filter = None   # 'median' | 'gaussian' | None
+        self._filter_kernel = 3.0
+        self._analyze_menu = QtWidgets.QMenu("Analyze")
+        analyze_menu = self._analyze_menu
+        self.pg_view.getView().menu.addSeparator()
+        self.pg_view.getView().menu.addMenu(analyze_menu)
+
+        self._median_filter_action = QtWidgets.QAction("Median Filter")
+        self._median_filter_action.setCheckable(True)
+        self._median_filter_action.triggered.connect(
+            lambda checked: self._set_filter('median', checked)
+        )
+        analyze_menu.addAction(self._median_filter_action)
+
+        self._gaussian_filter_action = QtWidgets.QAction("Gaussian Filter")
+        self._gaussian_filter_action.setCheckable(True)
+        self._gaussian_filter_action.triggered.connect(
+            lambda checked: self._set_filter('gaussian', checked)
+        )
+        analyze_menu.addAction(self._gaussian_filter_action)
 
         # --- Mouse signals ---
         self._mouse_move_proxy = pg.SignalProxy(
@@ -228,16 +262,48 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             # Offset the label perpendicularly away from the line
             dx, dy = x2 - x1, y2 - y1
             seg_len = np.sqrt(dx**2 + dy**2)
-            offset = max(seg_len * 0.1, 45)  # 15% of line length, min 25 px
+            offset = max(seg_len * 0.07, 30)
             if seg_len > 0:
                 px, py = -dy / seg_len * offset, dx / seg_len * offset
             else:
                 px, py = 0, offset
             self._distance_text.setPos((x1 + x2) / 2 + px, (y1 + y2) / 2 + py)
-            self._distance_text.setText(f"{dist_um:.2f} µm")
+            dist_px = int(round(np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)))
+            self._distance_text.setText(f"{dist_um:.3f} µm\n{dist_px} pix")
             self._distance_text.setVisible(True)
             self._update_lineout()
 
+
+    def _set_filter(self, filter_type: str, checked: bool):
+        if not checked:
+            self._active_filter = None
+        else:
+            kernel, ok = QtWidgets.QInputDialog.getDouble(
+                self, f"{filter_type.capitalize()} Filter", "Kernel width:",
+                value=self._filter_kernel, min=0.1, max=500.0, decimals=1
+            )
+            if not ok:
+                # User cancelled — revert the checkmark
+                action = self._median_filter_action if filter_type == 'median' else self._gaussian_filter_action
+                action.setChecked(False)
+                return
+            self._filter_kernel = kernel
+            self._active_filter = filter_type
+            # Uncheck the other filter
+            other = self._gaussian_filter_action if filter_type == 'median' else self._median_filter_action
+            other.setChecked(False)
+
+        # Re-display current image with (or without) the filter
+        item = self.treeWidget_fileStructure.currentItem()
+        if item is not None:
+            self.on_tree_item_clicked(item, 2)
+
+    def _copy_current_param_path(self):
+        item = self.treeWidget_fileStructure.currentItem()
+        if item is None:
+            return
+        param_path = Path(item.data(1, Qt.UserRole)).name
+        QApplication.clipboard().setText(str(param_path))
 
     def _toggle_lineout(self, checked: bool):
         self._lineout_visible = checked
@@ -343,7 +409,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         --- Click on two points to get distance and lineout
         --- Open lineout viewer with right-click on plot
         --- By default, probe viewer is centered on mode 0, and the right-click menu can turn this off
-        --- Right-click menu can reset zoom
+        --- Right-click menu can copy parameter folder string (Ndp256...)
+        --- Right-click menu can reset zoom and change default zoom behavior
 
         Scan goodness
         --- Row color shows scan goodness, tracked as txt file in scan folder
@@ -379,75 +446,89 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
     def on_add_scan_clicked(self):
         """
-        Show a dialog with a combo box to add a new scan.
-        Suggests the next 10 scan numbers based on the maximum existing scan.
+        Show a dialog to add one scan or a range of scans.
         """
         # Find the maximum scan number from _seen_scans
         max_scan_num = 0
         for scan_name in self._seen_scans:
-            # Extract number from S0001 format
             if len(scan_name) == 5 and scan_name.startswith("S") and scan_name[1:].isdigit():
-                scan_num = int(scan_name[1:])
-                max_scan_num = max(max_scan_num, scan_num)
-        
+                max_scan_num = max(max_scan_num, int(scan_name[1:]))
+
         # Create dialog
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Add Scan")
-        
         layout = QtWidgets.QVBoxLayout(dlg)
-        
-        # Add label
-        label = QtWidgets.QLabel("Select or enter scan name:")
-        layout.addWidget(label)
-        
-        # Create editable combo box
-        combo = QtWidgets.QComboBox()
-        combo.setEditable(True)
-        
-        # Populate with suggested scan names (next 10 scans)
+
+        # --- First scan combo ---
+        layout.addWidget(QtWidgets.QLabel("Select or enter scan name:"))
+        combo_first = QtWidgets.QComboBox()
+        combo_first.setEditable(True)
         for idx in range(1, 11):
-            scan_name = f"S{max_scan_num + idx:04d}"
-            combo.addItem(scan_name)
-        
-        layout.addWidget(combo)
-        
-        # Add OK/Cancel buttons
+            combo_first.addItem(f"S{max_scan_num + idx:04d}")
+        layout.addWidget(combo_first)
+
+        # --- Range row: checkbox + second combo ---
+        range_row = QtWidgets.QHBoxLayout()
+        chk_range = QtWidgets.QCheckBox("Enter range")
+        combo_last = QtWidgets.QComboBox()
+        combo_last.setEditable(True)
+        for idx in range(1, 11):
+            combo_last.addItem(f"S{max_scan_num + idx:04d}")
+        combo_last.setEnabled(False)
+        range_row.addWidget(chk_range)
+        range_row.addWidget(combo_last)
+        layout.addLayout(range_row)
+
+        chk_range.toggled.connect(combo_last.setEnabled)
+
+        # --- OK / Cancel ---
         button_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
         button_box.accepted.connect(dlg.accept)
         button_box.rejected.connect(dlg.reject)
         layout.addWidget(button_box)
-        
-        # Show dialog and get result
-        if dlg.exec() == QtWidgets.QDialog.Accepted:
-            selected_scan = combo.currentText()
-            
-            # Validate format: S followed by 4 digits
-            if len(selected_scan) == 5 and selected_scan.startswith("S") and selected_scan[1:].isdigit():
-                # Create scan path
-                scan_path = self.base_path / selected_scan
-                
-                # Check if it exists
-                if scan_path.exists():
-                    # Add to tree
-                    self._add_scan_row(scan_path)
-                    print(f"Added scan: {selected_scan}")
-                else:
-                    # Show error message
-                    QtWidgets.QMessageBox.warning(
-                        self,
-                        "Scan Not Found",
-                        f"Scan folder does not exist:\n{scan_path}"
-                    )
+
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return None
+
+        def parse_scan(text):
+            """Return scan number int if valid S#### format, else None."""
+            t = text.strip()
+            if len(t) == 5 and t.startswith("S") and t[1:].isdigit():
+                return int(t[1:])
+            return None
+
+        first_num = parse_scan(combo_first.currentText())
+        if first_num is None:
+            QtWidgets.QMessageBox.warning(self, "Invalid Format",
+                f"Invalid scan name: {combo_first.currentText()}\nExpected format: S#### (e.g., S0042)")
+            return None
+
+        if chk_range.isChecked():
+            last_num = parse_scan(combo_last.currentText())
+            if last_num is None:
+                QtWidgets.QMessageBox.warning(self, "Invalid Format",
+                    f"Invalid scan name: {combo_last.currentText()}\nExpected format: S#### (e.g., S0042)")
+                return None
+            scan_nums = range(min(first_num, last_num), max(first_num, last_num) + 1)
+        else:
+            scan_nums = [first_num]
+
+        missing = []
+        for num in scan_nums:
+            scan_name = f"S{num:04d}"
+            scan_path = self.base_path / scan_name
+            if scan_path.exists():
+                self._add_scan_row(scan_path)
+                print(f"Added scan: {scan_name}")
             else:
-                # Show format error
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "Invalid Format",
-                    f"Invalid scan name format: {selected_scan}\nExpected format: S#### (e.g., S0042)"
-                )
-        
+                missing.append(str(scan_path))
+
+        if missing:
+            QtWidgets.QMessageBox.warning(self, "Scan Not Found",
+                "The following scan folders were not found:\n" + "\n".join(missing))
+
         return None
 
 
@@ -911,12 +992,18 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._info_base_text = "%.2f\u00d7%.2f µm, %d nm pix" % (data.shape[0] * self.res_m * 1e6, data.shape[1] * self.res_m * 1e6, pix_size_nm)
         self.label_plot_info.setText(self._info_base_text)
 
-        # Display
-        if self.checkBox_logCmap.isChecked():
-            self.pg_view.setImage(np.log10(np.clip(np.abs(data), a_min=np.finfo(float).eps, a_max=None)), autoLevels=True)
+        # Apply filter
+        if self._active_filter == 'median':
+            data = median_filter(data, size=max(1, int(self._filter_kernel)))
+        elif self._active_filter == 'gaussian':
+            data = gaussian_filter(data, sigma=self._filter_kernel)
 
+        # Display
+        auto_range = self._auto_reset_zoom_action.isChecked()
+        if self.checkBox_logCmap.isChecked():
+            self.pg_view.setImage(np.log10(np.clip(np.abs(data), a_min=np.finfo(float).eps, a_max=None)), autoLevels=True, autoRange=auto_range)
         else:
-            self.pg_view.setImage(data, autoLevels=True)
+            self.pg_view.setImage(data, autoLevels=True, autoRange=auto_range)
 
         # Enable colorbar
         if not hasattr(self, "_colorbar_added"):
@@ -1004,6 +1091,10 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             action = menu.addAction("Refresh scan")
             action.triggered.connect(
                 lambda checked, p=(self.base_path / scan_name): self._refresh_scan_row(p)
+            )
+            remove_action = menu.addAction("Remove scan")
+            remove_action.triggered.connect(
+                lambda checked, n=scan_name, i=item: self._remove_scan_row(n, i)
             )
 
         elif column == 1:  # column 1 stores param folder
@@ -1251,6 +1342,19 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._scan_row_items[scan_path.name] = row_item
         self._populate_scan_row(row_item, scan_path)
 
+
+    def _remove_scan_row(self, scan_name: str, row_item: QtWidgets.QTreeWidgetItem):
+        # Col 0: remove from tree widget
+        index = self.treeWidget_fileStructure.indexOfTopLevelItem(row_item)
+        if index != -1:
+            self.treeWidget_fileStructure.takeTopLevelItem(index)
+        # Col 0: scan_row_items + seen_scans
+        self._scan_row_items.pop(scan_name, None)
+        self._seen_scans.discard(scan_name)
+        # Col 1: param folders
+        self._seen_param_folders.pop(scan_name, None)
+        # Col 2: recon files
+        self._seen_recon_files.pop(scan_name, None)
 
     def _refresh_scan_row(self, scan_path: Path):
         """
