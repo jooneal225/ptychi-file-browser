@@ -1,5 +1,6 @@
 import sys
 import os
+import shutil
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -432,13 +433,29 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         with open(os.path.join(data_main_dir, 'ptychi_recons', 'recon_completed.csv'), "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["S%04d" % scan_num])
+
+        Deleting
+        !!!These are irreversible, handle with caution!!!
+        --- Right-click menu of each scan has several delete options, they all pop up a confirmation dialog
+        ----- "Delete all reconstructions" deletes the entire scan folder
+        ----- "Delete currently selected reconstruction" deletes entire parameter folder (e.g. starts with Ndp256)
+        ----- "Delete intermediate reconstructions" deletes all files associated with intermediate iterations
+        ------- Only targets current parameter folder, and will list every file before deletion
+        --- Tips menu has "Delete intermediate reconstructions tool" button
+        ----- Loops through every parameter folder within scan range, deleting all intermediate iteration files
         """.strip())
 
         layout.addWidget(edit)
 
-        btn = QtWidgets.QPushButton("Close")
-        btn.clicked.connect(dlg.accept)
-        layout.addWidget(btn)
+        btn_row = QtWidgets.QHBoxLayout()
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        del_tool_btn = QtWidgets.QPushButton("Delete intermediate reconstructions tool")
+        del_tool_btn.setStyleSheet("background-color: red; color: white;")
+        del_tool_btn.clicked.connect(lambda: (dlg.accept(), self.show_delete_intermediate_tool()))
+        btn_row.addWidget(close_btn)
+        btn_row.addWidget(del_tool_btn)
+        layout.addLayout(btn_row)
 
         dlg.resize(700, 400)
         dlg.exec()
@@ -1092,10 +1109,45 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             action.triggered.connect(
                 lambda checked, p=(self.base_path / scan_name): self._refresh_scan_row(p)
             )
-            remove_action = menu.addAction("Remove scan")
+            remove_action = menu.addAction("Remove scan from list")
             remove_action.triggered.connect(
                 lambda checked, n=scan_name, i=item: self._remove_scan_row(n, i)
             )
+
+            # "Delete Reconstructions" submenu with red text via QWidgetAction
+            delete_menu = QtWidgets.QMenu(menu)
+            delete_menu.setStyleSheet(
+                "QMenu::item { color: darkred; }"
+                "QMenu::item:selected { background-color: #8b0000; color: white; }"
+            )
+            scan_path = self.base_path / scan_name
+            del_all_action = delete_menu.addAction(f"Delete all reconstructions for '{scan_name}'")
+            del_all_action.triggered.connect(
+                lambda checked, n=scan_name, p=scan_path, i=item: self._delete_scan_folder(n, p, i)
+            )
+            param_path = item.data(1, Qt.UserRole)
+            if isinstance(param_path, Path):
+                del_current_action = delete_menu.addAction(
+                    f"Delete currently selected reconstruction: '{param_path.name}'"
+                )
+                del_current_action.triggered.connect(
+                    lambda checked, n=scan_name, p=param_path, i=item: self._delete_param_folder(n, p, i)
+                )
+                del_inter_action = delete_menu.addAction(
+                    f"Delete intermediate reconstructions: '{param_path.name}'"
+                )
+                del_inter_action.triggered.connect(
+                    lambda checked, n=scan_name, p=param_path: self._delete_intermediate_recons(n, p)
+                )
+
+            red_label = QtWidgets.QLabel("Delete Reconstructions Dialogs")
+            red_label.setStyleSheet("color: red; font-weight: bold; padding: 2px 40px 2px 20px;")
+            red_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            delete_widget_action = QtWidgets.QWidgetAction(menu)
+            delete_widget_action.setDefaultWidget(red_label)
+            delete_widget_action.setMenu(delete_menu)
+            menu.addSeparator()
+            menu.addAction(delete_widget_action)
 
         elif column == 1:  # column 1 stores param folder
             # Add all param folders for this scan to the menu
@@ -1342,6 +1394,218 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._scan_row_items[scan_path.name] = row_item
         self._populate_scan_row(row_item, scan_path)
 
+
+    def _confirm_delete(self, header_text: str, paths: list, relative_to: Path = None) -> bool:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Confirm Deletion")
+        layout = QtWidgets.QVBoxLayout(dlg)
+
+        layout.addWidget(QtWidgets.QLabel(header_text))
+
+        file_list = QtWidgets.QTextEdit()
+        file_list.setReadOnly(True)
+        file_list.setMaximumHeight(400)
+        file_list.setLineWrapMode(QtWidgets.QTextEdit.NoWrap)
+        file_list.setMinimumWidth(800)
+        lines = [
+            str(p.relative_to(relative_to)) if relative_to else p.name
+            for p in paths
+        ]
+        file_list.setPlainText("\n".join(lines))
+        layout.addWidget(file_list)
+
+        btn_row = QtWidgets.QHBoxLayout()
+
+        delete_btn = QtWidgets.QPushButton("Delete")
+        delete_btn.setStyleSheet("background-color: red; color: white; padding: 4px 16px;")
+        delete_btn.setAutoDefault(False)
+        delete_btn.setDefault(False)
+        delete_btn.clicked.connect(dlg.accept)
+
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.setStyleSheet("background-color: green; color: white; padding: 4px 16px;")
+        cancel_btn.setDefault(True)
+        cancel_btn.setAutoDefault(True)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        btn_row.addWidget(delete_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        cancel_btn.setFocus()
+        return dlg.exec_() == QtWidgets.QDialog.Accepted
+
+    def _build_intermediate_delete_list(self, param_path: Path) -> list:
+        """
+        Return a list of Paths for all intermediate reconstructions in param_path.
+        The highest-iteration recon_NiterN.h5 is kept; all others and their
+        derived files (comboBox items containing XXX but not recon_Niter) are deleted.
+        """
+        # Step 1: find all recon_NiterN.h5 files and their iteration numbers
+        niter_map = {}  # int -> Path
+        for f in param_path.glob("recon_Niter*.h5"):
+            token = f.stem[len("recon_Niter"):].split("_", 1)[0]
+            if token.isdigit():
+                niter_map[int(token)] = f
+
+        if not niter_map:
+            return []
+
+        max_niter = max(niter_map)
+        niters_to_delete = [n for n in niter_map if n != max_niter]
+        delete_paths = [niter_map[n] for n in niters_to_delete]
+
+        # Step 2: derived files from comboBox options containing XXX
+        for i in range(self.comboBox_imageChoice.count()):
+            option = self.comboBox_imageChoice.itemText(i)
+            if "recon_Niter" in option:
+                continue  # base recon files — already handled above
+            if "XXX" not in option:
+                continue
+            for n in niters_to_delete:
+                full_path = param_path / option.replace("XXX", str(n))
+                if full_path.exists():
+                    delete_paths.append(full_path)
+
+        return delete_paths
+
+    def _delete_intermediate_recons(self, scan_name: str, param_path: Path):
+        delete_paths = self._build_intermediate_delete_list(param_path)
+        if not delete_paths:
+            QtWidgets.QMessageBox.information(self, "Nothing to delete",
+                "No intermediate reconstructions found.")
+            return
+        if not self._confirm_delete(f"Delete files:\n{param_path}", delete_paths):
+            return
+        for p in delete_paths:
+            if p.exists():
+                p.unlink()
+        # Remove deleted recon files from tracker
+        deleted_names = {p for p in delete_paths}
+        current = self._seen_recon_files[scan_name].get(param_path.name, set())
+        self._seen_recon_files[scan_name][param_path.name] = current - deleted_names
+
+    def _collect_all_intermediate_delete_paths(self, first_num: int, last_num: int) -> list:
+        """Collect intermediate recon files for every param folder across a scan range."""
+        all_paths = []
+        for n in range(min(first_num, last_num), max(first_num, last_num) + 1):
+            scan_path = self.base_path / f"S{n:04d}"
+            if not scan_path.exists():
+                continue
+            try:
+                subdirs = sorted(d for d in scan_path.iterdir() if d.is_dir())
+            except PermissionError:
+                continue
+            for param_path in subdirs:
+                all_paths.extend(self._build_intermediate_delete_list(param_path))
+        return all_paths
+
+    def show_delete_intermediate_tool(self):
+        """Open a dialog to delete intermediate reconstructions across a scan range."""
+        max_scan_num = 0
+        for scan_name in self._seen_scans:
+            if len(scan_name) == 5 and scan_name.startswith("S") and scan_name[1:].isdigit():
+                max_scan_num = max(max_scan_num, int(scan_name[1:]))
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Delete Intermediate Reconstructions")
+        layout = QtWidgets.QVBoxLayout(dlg)
+
+        layout.addWidget(QtWidgets.QLabel("First scan in range:"))
+        combo_first = QtWidgets.QComboBox()
+        combo_first.setEditable(True)
+        for idx in range(1, 11):
+            combo_first.addItem(f"S{max_scan_num + idx:04d}")
+        layout.addWidget(combo_first)
+
+        layout.addWidget(QtWidgets.QLabel("Last scan in range:"))
+        combo_last = QtWidgets.QComboBox()
+        combo_last.setEditable(True)
+        for idx in range(1, 11):
+            combo_last.addItem(f"S{max_scan_num + idx:04d}")
+        layout.addWidget(combo_last)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        confirm_btn = QtWidgets.QPushButton("Confirm files")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(confirm_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        def parse_scan(text):
+            t = text.strip()
+            if len(t) == 5 and t.startswith("S") and t[1:].isdigit():
+                return int(t[1:])
+            return None
+
+        def on_confirm():
+            first_text = combo_first.currentText().strip()
+            last_text = combo_last.currentText().strip()
+            first_num = parse_scan(first_text)
+            last_num = parse_scan(last_text)
+            if first_num is None:
+                QtWidgets.QMessageBox.warning(dlg, "Invalid Format",
+                    f"Invalid scan name: {first_text}\nExpected: S#### (e.g., S0042)")
+                return
+            if last_num is None:
+                QtWidgets.QMessageBox.warning(dlg, "Invalid Format",
+                    f"Invalid scan name: {last_text}\nExpected: S#### (e.g., S0042)")
+                return
+
+            all_paths = self._collect_all_intermediate_delete_paths(first_num, last_num)
+            if not all_paths:
+                QtWidgets.QMessageBox.information(dlg, "Nothing to delete",
+                    "No intermediate reconstructions found in the given range.")
+                return
+
+            header = f"Delete files range:\n{first_text}\n{last_text}"
+            if not self._confirm_delete(header, all_paths, relative_to=self.base_path):
+                return
+
+            for p in all_paths:
+                if p.exists():
+                    p.unlink()
+
+            # Update trackers
+            deleted_set = set(all_paths)
+            lo, hi = min(first_num, last_num), max(first_num, last_num)
+            for n in range(lo, hi + 1):
+                sname = f"S{n:04d}"
+                if sname in self._seen_recon_files:
+                    for pname in self._seen_recon_files[sname]:
+                        self._seen_recon_files[sname][pname] -= deleted_set
+
+            dlg.accept()
+
+        confirm_btn.clicked.connect(on_confirm)
+        dlg.resize(380, 180)
+        dlg.exec()
+
+    def _delete_scan_folder(self, scan_name: str, scan_path: Path, item: QtWidgets.QTreeWidgetItem):
+        if not self._confirm_delete(f"Delete files:\n{scan_path.parent}", [scan_path]):
+            return
+        shutil.rmtree(scan_path)
+        self._remove_scan_row(scan_name, item)
+
+    def _delete_param_folder(self, scan_name: str, param_path: Path, item: QtWidgets.QTreeWidgetItem):
+        if not self._confirm_delete(f"Delete files:\n{param_path.parent}", [param_path]):
+            return
+        shutil.rmtree(param_path)
+        # Clean up trackers
+        self._seen_param_folders[scan_name].discard(param_path)
+        self._seen_recon_files[scan_name].pop(param_path.name, None)
+        # Update the tree row
+        remaining = sorted(self._seen_param_folders[scan_name])
+        if remaining:
+            self._switch_param_folder(item, scan_name, remaining[-1])
+        else:
+            item.setText(1, "—")
+            item.setData(1, Qt.UserRole, None)
+            item.setData(1, Qt.ToolTipRole, "No parameter folder found")
+            item.setText(2, "—")
+            item.setData(2, Qt.UserRole, None)
+            item.setData(2, Qt.ToolTipRole, "No recon file found")
 
     def _remove_scan_row(self, scan_name: str, row_item: QtWidgets.QTreeWidgetItem):
         # Col 0: remove from tree widget
