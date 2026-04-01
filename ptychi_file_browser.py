@@ -542,6 +542,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             else:
                 missing.append(str(scan_path))
 
+        self.treeWidget_fileStructure.sortItems(0, Qt.AscendingOrder)
+
         if missing:
             QtWidgets.QMessageBox.warning(self, "Scan Not Found",
                 "The following scan folders were not found:\n" + "\n".join(missing))
