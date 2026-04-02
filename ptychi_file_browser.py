@@ -106,6 +106,33 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._lineout_plot.setLabel('left', 'Value')
         self._lineout_plot.setVisible(False)
 
+        # Resolution metric: two draggable vertical lines + corner text
+        self._lineout_dist_um = None
+        self._lineout_values = None
+        self._res_lines_positioned = False
+        self._res_line1 = pg.InfiniteLine(
+            pos=0.0, angle=90, movable=True,
+            pen=pg.mkPen(color=(80, 120, 255), width=1.5, style=Qt.DotLine)
+        )
+        self._res_line2 = pg.InfiniteLine(
+            pos=1.0, angle=90, movable=True,
+            pen=pg.mkPen(color=(80, 220, 80), width=1.5, style=Qt.DotLine)
+        )
+        self._res_nm = None
+        self._res_region = None
+        self._res_line1.sigPositionChanged.connect(self._on_res_line_moved)
+        self._res_line2.sigPositionChanged.connect(self._on_res_line_moved)
+        self._res_text_item = pg.TextItem(text='', color='w', anchor=(1, 0),
+                                          fill=pg.mkBrush(0, 0, 0, 180))
+        _res_font = QFont("Courier", 9)
+        self._res_text_item.setFont(_res_font)
+        self._lineout_plot.getViewBox().sigRangeChanged.connect(self._reposition_res_text)
+        # Context menu action for the lineout plot
+        self._find_resolution_action = QtWidgets.QAction("Find 10%-90% resolution")
+        self._find_resolution_action.triggered.connect(self._find_resolution)
+        self._lineout_plot.getViewBox().menu.addSeparator()
+        self._lineout_plot.getViewBox().menu.addAction(self._find_resolution_action)
+
         splitter = QtWidgets.QSplitter(Qt.Vertical)
         splitter.addWidget(self.pg_view)
         splitter.addWidget(self._lineout_plot)
@@ -315,16 +342,114 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         if not self._lineout_visible:
             return
         self._lineout_plot.clear()
+        self._res_nm = None     # cleared by plot.clear()
+        self._res_region = None
         if len(self._measure_clicks) < 2:
+            self._lineout_dist_um = None
+            self._lineout_values = None
             return
         x1, y1 = self._measure_clicks[0]
         x2, y2 = self._measure_clicks[1]
         dist_um, values = self._compute_lineout(x1, y1, x2, y2)
         if dist_um is not None:
+            self._lineout_dist_um = dist_um
+            self._lineout_values = values
             self._lineout_plot.plot(dist_um, values, pen=pg.mkPen('w', width=1))
             marker_pen = pg.mkPen('r', width=1, style=Qt.DashLine)
             self._lineout_plot.addItem(pg.InfiniteLine(pos=dist_um[0],  angle=90, pen=marker_pen))
             self._lineout_plot.addItem(pg.InfiniteLine(pos=dist_um[-1], angle=90, pen=marker_pen))
+            # Position metric lines on first use, then keep user-dragged positions
+            if not self._res_lines_positioned:
+                span = dist_um[-1] - dist_um[0]
+                self._res_line1.setPos(dist_um[0] + span / 3)
+                self._res_line2.setPos(dist_um[0] + 2 * span / 3)
+                self._res_lines_positioned = True
+            # Re-add after clear() — ignoreBounds keeps them out of autoscale
+            self._lineout_plot.addItem(self._res_line1, ignoreBounds=True)
+            self._lineout_plot.addItem(self._res_line2, ignoreBounds=True)
+            self._lineout_plot.addItem(self._res_text_item, ignoreBounds=True)
+            self._update_res_metric()
+
+    def _on_res_line_moved(self):
+        """Called when a metric line is dragged — clears any computed resolution."""
+        self._clear_resolution()
+        self._update_res_metric()
+
+    def _clear_resolution(self):
+        if self._res_region is not None:
+            try:
+                self._lineout_plot.removeItem(self._res_region)
+            except Exception:
+                pass
+            self._res_region = None
+        self._res_nm = None
+
+    def _update_res_metric(self):
+        if self._lineout_dist_um is None or self._lineout_values is None:
+            return
+        xb = self._res_line1.value()
+        xg = self._res_line2.value()
+        yb = float(np.interp(xb, self._lineout_dist_um, self._lineout_values))
+        yg = float(np.interp(xg, self._lineout_dist_um, self._lineout_values))
+        delta_x = abs(xg - xb)
+        lines = [
+            f"Blue  X: {xb:.3f} µm",
+            f"Blue  Y: {yb:.4g}",
+            f"Green X: {xg:.3f} µm",
+            f"Green Y: {yg:.4g}",
+            f"ΔX:      {delta_x:.3f} µm",
+        ]
+        if self._res_nm is not None:
+            lines.append(f"Resolution: {self._res_nm} nm")
+        self._res_text_item.setText("\n".join(lines))
+        self._reposition_res_text()
+
+    def _find_resolution(self):
+        if self._lineout_dist_um is None or self._lineout_values is None:
+            return
+        xb = self._res_line1.value()
+        xg = self._res_line2.value()
+        yb = float(np.interp(xb, self._lineout_dist_um, self._lineout_values))
+        yg = float(np.interp(xg, self._lineout_dist_um, self._lineout_values))
+
+        lo, hi = min(xb, xg), max(xb, xg)
+        mask = (self._lineout_dist_um >= lo) & (self._lineout_dist_um <= hi)
+        x_slice = self._lineout_dist_um[mask]
+        y_slice = self._lineout_values[mask]
+        if len(x_slice) < 2:
+            return
+
+        level_10 = yb + 0.1 * (yg - yb)
+        level_90 = yb + 0.9 * (yg - yb)
+
+        # np.interp requires monotonically increasing xp — sort by y value
+        if y_slice[-1] >= y_slice[0]:
+            x_10 = float(np.interp(level_10, y_slice, x_slice))
+            x_90 = float(np.interp(level_90, y_slice, x_slice))
+        else:
+            x_10 = float(np.interp(level_10, y_slice[::-1], x_slice[::-1]))
+            x_90 = float(np.interp(level_90, y_slice[::-1], x_slice[::-1]))
+
+        self._res_nm = int(round(abs(x_90 - x_10) * 1e3))
+
+        # Shade the region between the two crossings
+        self._clear_resolution()   # remove any old region first
+        self._res_nm = int(round(abs(x_90 - x_10) * 1e3))
+        self._res_region = pg.LinearRegionItem(
+            values=[min(x_10, x_90), max(x_10, x_90)],
+            brush=pg.mkBrush(160, 0, 200, 70),
+            movable=False,
+        )
+        self._lineout_plot.addItem(self._res_region, ignoreBounds=True)
+        self._update_res_metric()
+
+    def _reposition_res_text(self):
+        vr = self._lineout_plot.getViewBox().viewRange()
+        x_min, x_max = vr[0]
+        y_min, y_max = vr[1]
+        mx = (x_max - x_min) * 0.01
+        my = (y_max - y_min) * 0.02
+        self._res_text_item.setPos(x_max - mx, y_max - my)
 
     def _compute_lineout(self, x1, y1, x2, y2):
         img = self.pg_view.getImageItem().image
