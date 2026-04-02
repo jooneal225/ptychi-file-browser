@@ -534,6 +534,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         Plot
         --- Click on two points to get distance and lineout
         --- Open lineout viewer with right-click on plot
+        ----- Lineout viewer can be used to find the 10%-90% resolution
+        ----- Drag the blue and green lines to the boundaries of a hard edge, and the right-click menu will calculate it
         --- By default, probe viewer is centered on mode 0, and the right-click menu can turn this off
         --- Right-click menu can copy parameter folder string (Ndp256...)
         --- Right-click menu can reset zoom and change default zoom behavior
