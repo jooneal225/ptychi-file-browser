@@ -8,6 +8,7 @@ import h5py
 import tifffile
 from PIL import Image
 import time
+import pyqtgraph as pg
 
 from scan_watcher_thread import ScanWatcherThread
 from pg_image_tools import ImagePlotWidget
@@ -22,7 +23,36 @@ SCAN_BAD_LIST_FILENAME = "scan_bad_list.csv"
 SCAN_BAD_SCAN_COL = "scan"
 SCAN_BAD_FLAG_COL = "is bad"
 RUNTABLE_BAD_HEADER = "bad"
-LOG_CSV_VIEW_COLS = ["scan", "completed", "date", "time", "ExpTime", "n_pos", "phi", "scan_type"]
+LOG_CSV_VIEW_COLS = ["scan", "completed", "sample_name", "date", "time", "ExpTime", "n_pos",
+                     "phi", "scan_type"]
+
+# ---- runtable plot pane ----
+# Where the runtable's plots look for their data. Every subdir is relative to
+# base_path.parent, the same place the log csv and the raw ptycho/ folders live.
+# '{scan}' is the scan string from the table ("S0041"); '{scan3}' is its last
+# three characters ("041"), the older three-digit run folder naming.
+#
+# Each source is tried in order and the first one that yields data wins, so a
+# missing directory, a missing dataset or an unreadable file is never an error,
+# just a reason to try the next entry. 'match' is a substring of the file name
+# (".h5" is matched as a suffix instead) and 'pick' is 'newest' by modification
+# time or 'first' alphabetically.
+RUNTABLE_IMAGE_DATASETS = ("/entry/data/data", "/entry/data/data00001")
+RUNTABLE_IMAGE_SOURCES = (
+    {"subdir": "preproc/{scan}", "match": "_dp.", "pick": "newest", "datasets": ("/dp",)},
+    {"subdir": "results/{scan}", "match": "_dp.", "pick": "newest", "datasets": ("/dp",)},
+    {"subdir": "ptycho/{scan}",  "match": ".h5", "pick": "first", "datasets": RUNTABLE_IMAGE_DATASETS},
+    {"subdir": "ptycho/{scan3}", "match": ".h5", "pick": "first", "datasets": RUNTABLE_IMAGE_DATASETS},
+    {"subdir": "SAXS/{scan}",    "match": ".h5", "pick": "first", "datasets": RUNTABLE_IMAGE_DATASETS},
+    {"subdir": "SAXS/{scan3}",   "match": ".h5", "pick": "first", "datasets": RUNTABLE_IMAGE_DATASETS},
+)
+
+RUNTABLE_SCATTER_SOURCES = (
+    {"subdir": "preproc/{scan}", "match": "_para.", "pick": "newest", "x": "/ppX", "y": "/ppY"},
+    {"subdir": "results/{scan}", "match": "_para.", "pick": "newest", "x": "/ppX", "y": "/ppY"},
+)
+
+RUNTABLE_NO_FILE_TEXT = "no file found"
 
 # scan_step_size motor -> (displayed unit, multiplier from the unit in the csv).
 # Everything not listed here is a real motor, stored in mm and shown in microns.
@@ -93,6 +123,15 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._log_csv_stat = None      # (st_mtime, st_size) guard
         self.runtable_window = None    # non-blocking viewer, kept alive on self
         self._runtable_updating = False  # guard against itemChanged while rebuilding
+
+        # ---- runtable plot pane (built lazily by the 'Show Plots' button) ----
+        self._runtable_plot_panel = None   # the whole lower half, None until built
+        self._runtable_image_plot = None   # ImagePlotWidget, left
+        self._runtable_scatter = None      # pg.ScatterPlotItem, right
+        self._runtable_plot_scan = None    # scan string currently plotted
+        self._runtable_img_source = None   # (scan, Path, dataset name) cache
+        self._runtable_image_error = None  # unreadable-file message, or None
+        self._runtable_scatter_error = None
 
         self.treeWidget_fileStructure.installEventFilter(self)
 
@@ -282,33 +321,21 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         --- Green is a good ptycho recon, yellow marks a scan to reanalyze, red is bad data
         
         Sample names
-        --- Taken from the log csv first, then the sources below, then a dash
-        --- Pulled from file 'runtable_full_{self.base_path.parent.name}.csv'
-        --- File must be located in parent of base path
-        --- i.e. {self.base_path.parent}
-        --- Searches for scan number in column 'run', and returns corresponding string from 'sample_name'
+        --- Taken from the log csv first, then old 'runtable_full_.csv', then a dash
+        --- Files must be located in parent of base path
 
         Log CSV / Runtable
         --- On Populate tree or Load tree, searches parent of base path for .csv files
-        --- i.e. {self.base_path.parent}
-        --- If more than one is found, a popup asks which to use, and the choice is remembered
-        --- Must have a 'scan' column of four-digit run numbers, i.e. S0001, or all of this is skipped
         --- Duplicate scan numbers use the last row in the file
-        --- Column 'sample_name' feeds the sample name column, before the runtable and file name guesses
-        --- Re-read when a brand new scan is added, so scans measured after startup still get info
-        --- File is only ever opened read only, so it never blocks whatever is writing to it
         --- "View Runtable" opens a filtered, color-coded table in its own window
-        ----- Shows scan, completed, date, time, ExpTime, n_pos, phi, scan_type
-        ----- Then one column per entry in 'scan_step_size', motors in microns, time in ms, phi in deg
-        ----- Row color starts from scan goodness, then pale green if a recon file exists in the tree
-        ----- or yellow if it does not, and finally red if 'completed' is no
-        ----- Far right "bad" checkbox is ticked for every red row, and ticking one turns its row red
-        ----- Ticks are saved to '{SCAN_BAD_LIST_FILENAME}' next to the log csv, as columns 'scan' and 'is bad'
-        ----- That file is written on populate, on refresh, and when either window is closed
-        ----- An 'is bad' of yes forces a row red on reload, so untick a row to take the mark back off
+        ----- Red means ignore this run. Yellow means needs reconstruction. Green means all good
+        ----- "Bad" checkbox saved between sessions, allows manual control
+        ----- "Show Plots" splits the window and plots a diffraction pattern and the scan positions
+        ------- A red bar appears if a file and its dataset are both there but will not
+        ------- read, which usually means compressed data needing an HDF5 filter plugin
 
         Scan Auto Updater
-        --- Every 10.0 s, checks a file {self.base_path / "recon_completed.csv"}
+        --- Every 10.0 s, checks a file "recon_completed.csv"
         --- Looks for new rows since last check, in the form S0001, i.e. four-digit run number
         --- Refreshes every scan number it finds
         --- Code to add to ptychi reconstruction script just after ptychi handles the reconstruction:
@@ -325,8 +352,13 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         ----- "Delete currently selected reconstruction" deletes entire parameter folder (e.g. starts with Ndp256)
         ----- "Delete intermediate reconstructions" deletes all files associated with intermediate iterations
         ------- Only targets current parameter folder, and will list every file before deletion
-        --- Tips menu has "Delete intermediate reconstructions tool" button
-        ----- Loops through every parameter folder within scan range, deleting all intermediate iteration files
+        --- Tips menu has "Delete reconstructions tool" button, which offers two range tools
+        ----- "Delete intermediate" loops through every parameter folder within a scan range,
+        ------- deleting all intermediate iteration files
+        ----- "Delete empty" loops through every parameter folder within a scan range,
+        ------- deleting any parameter folder that holds no recon (.h5) file
+        ------- If a scan is left with no parameter folders, the whole scan folder is deleted too
+        ----- Both list every path before anything is deleted
         """.strip())
 
         layout.addWidget(edit)
@@ -339,9 +371,9 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.comboBox_fontSize.addItems([str(s) for s in [6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24]])
         self.comboBox_fontSize.setCurrentText("10")
         self.comboBox_fontSize.currentTextChanged.connect(self.on_font_size_changed)
-        del_tool_btn = QtWidgets.QPushButton("Delete intermediate reconstructions tool")
+        del_tool_btn = QtWidgets.QPushButton("Delete reconstructions tool")
         del_tool_btn.setStyleSheet("background-color: red; color: white;")
-        del_tool_btn.clicked.connect(lambda: (dlg.accept(), self.show_delete_intermediate_tool()))
+        del_tool_btn.clicked.connect(lambda: (dlg.accept(), self.show_delete_recons_tool()))
         btn_row.addWidget(close_btn)
         btn_row.addWidget(fontSize_label)
         btn_row.addWidget(self.comboBox_fontSize)
@@ -1397,15 +1429,30 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             self.tableWidget_runtable.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
             self.tableWidget_runtable.verticalHeader().setVisible(False)
             self.tableWidget_runtable.itemChanged.connect(self._on_runtable_item_changed)
-            layout.addWidget(self.tableWidget_runtable)
+            self.tableWidget_runtable.itemSelectionChanged.connect(
+                self._on_runtable_row_selected
+            )
+
+            # The plot pane is added as the splitter's second widget the first
+            # time 'Show Plots' is checked; until then the table has it all.
+            self._runtable_splitter = QtWidgets.QSplitter(Qt.Vertical)
+            self._runtable_splitter.addWidget(self.tableWidget_runtable)
+            layout.addWidget(self._runtable_splitter)
 
             btn_row = QtWidgets.QHBoxLayout()
             close_btn = QtWidgets.QPushButton("Close")
             close_btn.clicked.connect(dlg.close)
             refresh_btn = QtWidgets.QPushButton("Refresh")
             refresh_btn.clicked.connect(self.on_runtable_refresh)
+            plots_btn = QtWidgets.QPushButton("Show Plots")
+            plots_btn.setCheckable(True)
+            plots_btn.setToolTip(
+                "Show a diffraction pattern and the scan positions for the selected scan"
+            )
+            plots_btn.toggled.connect(self._on_runtable_show_plots_toggled)
             btn_row.addWidget(close_btn)
             btn_row.addWidget(refresh_btn)
+            btn_row.addWidget(plots_btn)
             btn_row.addStretch()
             layout.addLayout(btn_row)
 
@@ -1423,6 +1470,411 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.save_scan_bad_list()
         self.reload_log_csv_full()
         self._rebuild_runtable_table()
+
+
+    # ------------------------------------------------------------------
+    # runtable plot pane
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _elide_label(label, text, width=500):
+        """Write text into a label elided in the middle, full text as tooltip."""
+        label.setText(label.fontMetrics().elidedText(text, Qt.ElideMiddle, width))
+        label.setToolTip(text)
+
+
+    def _build_runtable_plot_panel(self):
+        """
+        Build the lower half of the runtable: a diffraction pattern on the
+        left and the scan positions on the right, with a slice picker and the
+        image display toggles above them. Called once, on the first time the
+        'Show Plots' button is checked.
+        """
+        panel = QtWidgets.QWidget()
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.addWidget(QtWidgets.QLabel("slice"))
+        self.spinBox_runtableSlice = QtWidgets.QSpinBox()
+        self.spinBox_runtableSlice.setRange(0, 0)
+        self.spinBox_runtableSlice.setKeyboardTracking(False)
+        self.spinBox_runtableSlice.valueChanged.connect(self._on_runtable_slice_changed)
+        controls.addWidget(self.spinBox_runtableSlice)
+        # Both on by default: diffraction patterns are unreadable linear, and
+        # the detector's axes come in the other way round from pyqtgraph's
+        self.checkBox_runtableLog = QtWidgets.QCheckBox("log")
+        self.checkBox_runtableLog.setChecked(True)
+        self.checkBox_runtableTranspose = QtWidgets.QCheckBox("transpose")
+        self.checkBox_runtableTranspose.setChecked(True)
+        controls.addWidget(self.checkBox_runtableLog)
+        controls.addWidget(self.checkBox_runtableTranspose)
+        controls.addStretch()
+        panel_layout.addLayout(controls)
+
+        # Only shown when a file that is there, holding a dataset that is
+        # there, still would not read -- see _read_runtable_slice
+        self.label_runtableError = QtWidgets.QLabel()
+        self.label_runtableError.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.label_runtableError.setStyleSheet(
+            "QLabel { background-color: %s; color: #9c0006; padding: 2px; }"
+            % GOODNESS_COLORS['bad'].name()
+        )
+        self.label_runtableError.setVisible(False)
+        panel_layout.addWidget(self.label_runtableError)
+
+        plots = QtWidgets.QSplitter(Qt.Horizontal)
+
+        # --- left: one slice of the 3d diffraction data ---
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        self.label_runtableImagePath = QtWidgets.QLabel()
+        self.label_runtableImagePath.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        left_layout.addWidget(self.label_runtableImagePath)
+        self._runtable_image_plot = ImagePlotWidget(
+            title_label=self.label_runtableImagePath,
+            log_checkbox=self.checkBox_runtableLog,
+            transpose_checkbox=self.checkBox_runtableTranspose,
+        )
+        left_layout.addWidget(self._runtable_image_plot)
+        plots.addWidget(left)
+
+        # --- right: the scan positions ---
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        self.label_runtableScatterPath = QtWidgets.QLabel()
+        self.label_runtableScatterPath.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        right_layout.addWidget(self.label_runtableScatterPath)
+        scatter_plot = pg.PlotWidget()
+        scatter_plot.setAspectLocked(True)
+        scatter_plot.setLabel("bottom", "ppX (um)")
+        scatter_plot.setLabel("left", "ppY (um)")
+        self._runtable_scatter = pg.ScatterPlotItem(
+            size=5, pen=pg.mkPen(None), brush=pg.mkBrush(30, 120, 255, 180)
+        )
+        scatter_plot.addItem(self._runtable_scatter)
+        right_layout.addWidget(scatter_plot)
+        plots.addWidget(right)
+
+        plots.setSizes([500, 500])
+        panel_layout.addWidget(plots)
+
+        self._runtable_plot_panel = panel
+        self._runtable_splitter.addWidget(panel)
+
+
+    def _on_runtable_show_plots_toggled(self, checked):
+        """Show or hide the plot pane, building it the first time round."""
+        if checked and self._runtable_plot_panel is None:
+            self._build_runtable_plot_panel()
+            self._runtable_splitter.setSizes([350, 350])
+
+        if self._runtable_plot_panel is not None:
+            self._runtable_plot_panel.setVisible(checked)
+
+        if checked:
+            # Plot whatever row is already selected
+            self._runtable_plot_scan = None
+            self._on_runtable_row_selected()
+
+
+    def _selected_runtable_scan(self):
+        """
+        The scan string of the selected runtable row, or None.
+
+        Read off the checkbox column, where _make_runtable_bad_item stashed it
+        so it survives sorting, falling back to the visible first column.
+        """
+        table = self.tableWidget_runtable
+        row = table.currentRow()
+        if row < 0:
+            return None
+
+        item = table.item(row, table.columnCount() - 1)
+        scan = None if item is None else item.data(Qt.UserRole)
+        if scan is None:
+            item = table.item(row, 0)
+            scan = None if item is None else item.text()
+
+        scan = str(scan).strip() if scan is not None else ""
+        return scan or None
+
+
+    def _on_runtable_row_selected(self):
+        """Replot when the selected scan changes, if the plot pane is showing."""
+        if self._runtable_updating:
+            return
+        if self._runtable_plot_panel is None or self._runtable_plot_panel.isHidden():
+            return
+
+        scan_str = self._selected_runtable_scan()
+        if scan_str == self._runtable_plot_scan:
+            return
+
+        self._runtable_plot_scan = scan_str
+        self._runtable_img_source = None   # a new scan means a new file search
+
+        if scan_str is None:
+            self._clear_runtable_plots()
+            return
+
+        self._update_runtable_image(scan_str)
+        self._update_runtable_scatter(scan_str)
+
+
+    def _on_runtable_slice_changed(self, _value):
+        """Re-read just the image; the cached source keeps this off the network."""
+        if self._runtable_updating or self._runtable_plot_scan is None:
+            return
+        self._update_runtable_image(self._runtable_plot_scan)
+
+
+    def _set_runtable_slice_range(self, n_slices, value):
+        """Point the slice spinbox at a stack of n_slices, without replotting."""
+        spin = self.spinBox_runtableSlice
+        spin.blockSignals(True)
+        spin.setMaximum(max(0, n_slices - 1))
+        spin.setValue(value)
+        spin.blockSignals(False)
+
+
+    def _refresh_runtable_error(self):
+        """
+        Show the red banner if either plot hit a file it could not read, and
+        hide it otherwise. A scan with no files at all is not a failure, so it
+        leaves the banner alone.
+        """
+        parts = []
+        if self._runtable_image_error:
+            parts.append(f"image: {self._runtable_image_error}")
+        if self._runtable_scatter_error:
+            parts.append(f"positions: {self._runtable_scatter_error}")
+
+        label = self.label_runtableError
+        if not parts:
+            label.clear()
+            label.setToolTip("")
+            label.setVisible(False)
+            return
+
+        self._elide_label(label, "   |   ".join(parts), width=900)
+        label.setVisible(True)
+
+
+    def _clear_runtable_plots(self):
+        """Blank both plots, e.g. when nothing is selected."""
+        self._runtable_image_plot.clear_image()
+        self._runtable_image_plot.set_title(RUNTABLE_NO_FILE_TEXT)
+        self._set_runtable_slice_range(0, 0)
+        self._runtable_scatter.setData(x=[], y=[])
+        self._elide_label(self.label_runtableScatterPath, RUNTABLE_NO_FILE_TEXT)
+        self._runtable_image_error = None
+        self._runtable_scatter_error = None
+        self._refresh_runtable_error()
+
+
+    def _update_runtable_image(self, scan_str):
+        """Draw the requested slice for one scan, or blank the plot."""
+        plot = self._runtable_image_plot
+        index = self.spinBox_runtableSlice.value()
+
+        data, path, n_slices, source, error = self._runtable_load_image(scan_str, index)
+        self._runtable_image_error = error
+        self._refresh_runtable_error()
+
+        if data is None:
+            self._runtable_img_source = None
+            plot.clear_image()
+            plot.set_title(RUNTABLE_NO_FILE_TEXT)
+            self._set_runtable_slice_range(0, 0)
+            return
+
+        self._runtable_img_source = source
+        # The loader clamps; keep the spinbox agreeing with what is on screen
+        self._set_runtable_slice_range(n_slices, min(index, max(0, n_slices - 1)))
+        plot.set_title(str(path))
+        plot.set_image(data)
+
+
+    def _update_runtable_scatter(self, scan_str):
+        """Draw the scan positions for one scan, or blank the plot."""
+        x, y, path, error = self._runtable_load_scatter(scan_str)
+        self._runtable_scatter_error = error
+        self._refresh_runtable_error()
+
+        if x is None:
+            self._runtable_scatter.setData(x=[], y=[])
+            self._elide_label(self.label_runtableScatterPath, RUNTABLE_NO_FILE_TEXT)
+            return
+
+        self._runtable_scatter.setData(x=x, y=y)
+        self._elide_label(self.label_runtableScatterPath, str(path))
+
+
+    # ---- file resolution for the plot pane ----
+
+    def _runtable_pick_file(self, scan_str, source):
+        """
+        The file one RUNTABLE_*_SOURCES entry points at, or None.
+
+        A missing base path, a missing directory or an empty directory are all
+        just a miss, so the caller can move on to the next source.
+        """
+        if self.base_path is None:
+            return None
+
+        subdir = source["subdir"].format(scan=scan_str, scan3=scan_str[2:])
+        folder = self.base_path.parent / subdir
+        match = source["match"]
+
+        try:
+            if match == ".h5":
+                hits = [p for p in folder.iterdir()
+                        if p.is_file() and p.name.endswith(".h5")]
+            else:
+                hits = [p for p in folder.iterdir()
+                        if p.is_file() and match in p.name]
+
+            if not hits:
+                return None
+            if source["pick"] == "newest":
+                return max(hits, key=lambda p: p.stat().st_mtime)
+            return sorted(hits)[0]
+        except OSError:
+            return None
+
+
+    @staticmethod
+    def _read_runtable_slice(path, dataset_names, index):
+        """
+        Read one 2d slice out of an h5 file.
+
+        Tries each name in dataset_names in turn. A 2d dataset is returned
+        whole and the index ignored; a 3d one is indexed along dimension 0,
+        clamped into range.
+
+        Returns (result, error). result is (data, n_slices, dataset name), or
+        None when nothing could be read. error is a message only when the file
+        opened and held one of the names but the bytes would not come out --
+        nearly always compressed data whose filter plugin is not installed --
+        and stays None for the ordinary misses the caller expects to walk past.
+        """
+        try:
+            f = h5py.File(path, "r")
+        except OSError as exc:
+            return None, f"cannot open {path.name}: {exc}"
+
+        try:
+            with f:
+                for name in dataset_names:
+                    if name not in f:
+                        continue
+                    try:
+                        dset = f[name]
+                        if dset.ndim == 2:
+                            return (np.asarray(dset[()]), 1, name), None
+                        if dset.ndim == 3 and dset.shape[0] > 0:
+                            i = min(max(index, 0), dset.shape[0] - 1)
+                            return (np.asarray(dset[i]), dset.shape[0], name), None
+                    except (OSError, ValueError, IndexError, TypeError) as exc:
+                        return None, (f"could not read {name} in {path.name} "
+                                      f"- HDF5 plugin may be required ({exc})")
+        except (OSError, KeyError, ValueError, TypeError) as exc:
+            return None, f"could not read {path.name}: {exc}"
+
+        return None, None
+
+
+    def _runtable_load_image(self, scan_str, index):
+        """
+        Find and read a diffraction pattern for one scan.
+
+        Returns (data, path, n_slices, source, error) where source is the
+        (scan, path, dataset name) triple to cache. When nothing could be read
+        the first four are empty and error carries the first real read failure,
+        if there was one -- a scan with simply no files anywhere is not an
+        error, so error stays None for it.
+        """
+        errors = []
+
+        def note(error):
+            if error and error not in errors:
+                errors.append(error)
+
+        cached = self._runtable_img_source
+        if cached is not None and cached[0] == scan_str:
+            result, error = self._read_runtable_slice(cached[1], (cached[2],), index)
+            if result is not None:
+                data, n_slices, _ = result
+                return data, cached[1], n_slices, cached, None
+            note(error)
+
+        for source in RUNTABLE_IMAGE_SOURCES:
+            path = self._runtable_pick_file(scan_str, source)
+            if path is None:
+                continue
+            result, error = self._read_runtable_slice(path, source["datasets"], index)
+            if result is None:
+                note(error)
+                continue
+            data, n_slices, name = result
+            return data, path, n_slices, (scan_str, path, name), None
+
+        return None, None, 0, None, (errors[0] if errors else None)
+
+
+    def _runtable_load_scatter(self, scan_str):
+        """
+        Find and read the scan positions for one scan.
+
+        Returns (x, y, path, error). When nothing could be read the first three
+        are None and error carries the first real read failure, as in
+        _runtable_load_image.
+        """
+        errors = []
+
+        def note(error):
+            if error and error not in errors:
+                errors.append(error)
+
+        for source in RUNTABLE_SCATTER_SOURCES:
+            path = self._runtable_pick_file(scan_str, source)
+            if path is None:
+                continue
+
+            try:
+                f = h5py.File(path, "r")
+            except OSError as exc:
+                note(f"cannot open {path.name}: {exc}")
+                continue
+
+            try:
+                with f:
+                    if source["x"] not in f or source["y"] not in f:
+                        continue
+                    try:
+                        x = np.asarray(f[source["x"]][()], dtype=float).ravel()
+                        y = np.asarray(f[source["y"]][()], dtype=float).ravel()
+                    except (OSError, ValueError, TypeError) as exc:
+                        note(f"could not read {source['x']} and {source['y']} in "
+                             f"{path.name} - HDF5 plugin may be required ({exc})")
+                        continue
+            except (OSError, KeyError, ValueError, TypeError) as exc:
+                note(f"could not read {path.name}: {exc}")
+                continue
+
+            n = min(x.size, y.size)
+            if n == 0:
+                continue
+
+            # Stored in metres and offset by wherever the stage happened to be;
+            # what matters is the shape of the scan, in microns about its centre
+            x, y = x[:n], y[:n]
+            return (x - x.mean()) * 1e6, (y - y.mean()) * 1e6, path, None
+
+        return None, None, None, (errors[0] if errors else None)
 
 
     # ------------------------------------------------------------------
@@ -2189,15 +2641,168 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                 all_paths.extend(self._build_intermediate_delete_list(param_path))
         return all_paths
 
+    def _build_empty_delete_plan(self, first_num: int, last_num: int) -> list:
+        """
+        Plan the removal of param folders that hold no recon (.h5) file across a scan range.
+
+        Returns a list of dicts, one per affected scan:
+            {'scan_name', 'scan_path', 'param_paths', 'delete_scan'}
+        'delete_scan' is True when the scan is left with no param folders at all.
+        """
+        plan = []
+        for n in range(min(first_num, last_num), max(first_num, last_num) + 1):
+            scan_path = self.base_path / f"S{n:04d}"
+            if not scan_path.is_dir():
+                continue
+            try:
+                subdirs = sorted(d for d in scan_path.iterdir() if d.is_dir())
+            except PermissionError:
+                continue
+
+            empty_params = []
+            for param_path in subdirs:
+                try:
+                    has_recon = any(param_path.glob("*.h5"))
+                except PermissionError:
+                    continue
+                if not has_recon:
+                    empty_params.append(param_path)
+
+            delete_scan = len(empty_params) == len(subdirs)
+            if not empty_params and not delete_scan:
+                continue
+            plan.append({
+                'scan_name': scan_path.name,
+                'scan_path': scan_path,
+                'param_paths': empty_params,
+                'delete_scan': delete_scan,
+            })
+        return plan
+
+    def _collect_all_empty_delete_paths(self, first_num: int, last_num: int) -> list:
+        """Collect empty param folders (and emptied scan folders) across a scan range."""
+        self._empty_delete_plan = self._build_empty_delete_plan(first_num, last_num)
+        all_paths = []
+        for entry in self._empty_delete_plan:
+            all_paths.extend(entry['param_paths'])
+            if entry['delete_scan']:
+                all_paths.append(entry['scan_path'])
+        return all_paths
+
+    def _apply_empty_deletions(self, first_num: int, last_num: int, all_paths: list):
+        """Delete the folders planned by the most recent _collect_all_empty_delete_paths call."""
+        for entry in getattr(self, '_empty_delete_plan', []):
+            scan_name = entry['scan_name']
+
+            for param_path in entry['param_paths']:
+                if param_path.exists():
+                    shutil.rmtree(param_path)
+                if scan_name in self._seen_param_folders:
+                    self._seen_param_folders[scan_name].discard(param_path)
+                if scan_name in self._seen_recon_files:
+                    self._seen_recon_files[scan_name].pop(param_path.name, None)
+
+            if entry['delete_scan']:
+                if entry['scan_path'].exists():
+                    shutil.rmtree(entry['scan_path'])
+                row_item = self._scan_row_items.get(scan_name)
+                if row_item is not None:
+                    self._remove_scan_row(scan_name, row_item)
+                else:
+                    self._seen_scans.discard(scan_name)
+                    self._seen_param_folders.pop(scan_name, None)
+                    self._seen_recon_files.pop(scan_name, None)
+            elif scan_name in self._scan_row_items:
+                # Row may still point at a folder that is now gone, so rebuild it
+                self._seen_param_folders.pop(scan_name, None)
+                self._seen_recon_files.pop(scan_name, None)
+                self._refresh_scan_row(entry['scan_path'])
+
+        self._empty_delete_plan = []
+
+    def _apply_intermediate_deletions(self, first_num: int, last_num: int, all_paths: list):
+        """Unlink every collected intermediate recon file and update the trackers."""
+        for p in all_paths:
+            if p.exists():
+                p.unlink()
+
+        deleted_set = set(all_paths)
+        lo, hi = min(first_num, last_num), max(first_num, last_num)
+        for n in range(lo, hi + 1):
+            sname = f"S{n:04d}"
+            if sname in self._seen_recon_files:
+                for pname in self._seen_recon_files[sname]:
+                    self._seen_recon_files[sname][pname] -= deleted_set
+
+    def show_delete_recons_tool(self):
+        """Ask which range delete tool to run, then open it."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Delete Reconstructions")
+        layout = QtWidgets.QVBoxLayout(dlg)
+
+        layout.addWidget(QtWidgets.QLabel(
+            "Delete intermediate: remove all but the last iteration in every parameter folder.\n"
+            "Delete empty: remove parameter folders with no recon file, and scans left with none."))
+
+        btn_row = QtWidgets.QHBoxLayout()
+        intermediate_btn = QtWidgets.QPushButton("Delete intermediate")
+        intermediate_btn.setStyleSheet("background-color: red; color: white; padding: 4px 16px;")
+        intermediate_btn.setAutoDefault(False)
+        intermediate_btn.setDefault(False)
+        intermediate_btn.clicked.connect(lambda: (dlg.accept(), self.show_delete_intermediate_tool()))
+
+        empty_btn = QtWidgets.QPushButton("Delete empty")
+        empty_btn.setStyleSheet("background-color: red; color: white; padding: 4px 16px;")
+        empty_btn.setAutoDefault(False)
+        empty_btn.setDefault(False)
+        empty_btn.clicked.connect(lambda: (dlg.accept(), self.show_delete_empty_tool()))
+
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.setStyleSheet("background-color: green; color: white; padding: 4px 16px;")
+        cancel_btn.setDefault(True)
+        cancel_btn.setAutoDefault(True)
+        cancel_btn.clicked.connect(dlg.reject)
+
+        btn_row.addWidget(intermediate_btn)
+        btn_row.addWidget(empty_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        cancel_btn.setFocus()
+        dlg.exec()
+
     def show_delete_intermediate_tool(self):
         """Open a dialog to delete intermediate reconstructions across a scan range."""
+        self._show_delete_range_tool(
+            "Delete Intermediate Reconstructions",
+            self._collect_all_intermediate_delete_paths,
+            self._apply_intermediate_deletions,
+            "No intermediate reconstructions found in the given range.",
+        )
+
+    def show_delete_empty_tool(self):
+        """Open a dialog to delete empty parameter folders across a scan range."""
+        self._show_delete_range_tool(
+            "Delete Empty Parameter Folders",
+            self._collect_all_empty_delete_paths,
+            self._apply_empty_deletions,
+            "No empty parameter folders found in the given range.",
+        )
+
+    def _show_delete_range_tool(self, window_title, collect_fn, delete_fn, nothing_msg):
+        """
+        Shared scan-range delete dialog: pick a range, review every path, then delete.
+
+        collect_fn(first_num, last_num) -> list of Paths to show and delete
+        delete_fn(first_num, last_num, all_paths) performs the deletion and tracker cleanup
+        """
         max_scan_num = 0
         for scan_name in self._seen_scans:
             if len(scan_name) == 5 and scan_name.startswith("S") and scan_name[1:].isdigit():
                 max_scan_num = max(max_scan_num, int(scan_name[1:]))
 
         dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Delete Intermediate Reconstructions")
+        dlg.setWindowTitle(window_title)
         layout = QtWidgets.QVBoxLayout(dlg)
 
         layout.addWidget(QtWidgets.QLabel("First scan in range:"))
@@ -2242,28 +2847,16 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                     f"Invalid scan name: {last_text}\nExpected: S#### (e.g., S0042)")
                 return
 
-            all_paths = self._collect_all_intermediate_delete_paths(first_num, last_num)
+            all_paths = collect_fn(first_num, last_num)
             if not all_paths:
-                QtWidgets.QMessageBox.information(dlg, "Nothing to delete",
-                    "No intermediate reconstructions found in the given range.")
+                QtWidgets.QMessageBox.information(dlg, "Nothing to delete", nothing_msg)
                 return
 
             header = f"Delete files range:\n{first_text}\n{last_text}"
             if not self._confirm_delete(header, all_paths, relative_to=self.base_path):
                 return
 
-            for p in all_paths:
-                if p.exists():
-                    p.unlink()
-
-            # Update trackers
-            deleted_set = set(all_paths)
-            lo, hi = min(first_num, last_num), max(first_num, last_num)
-            for n in range(lo, hi + 1):
-                sname = f"S{n:04d}"
-                if sname in self._seen_recon_files:
-                    for pname in self._seen_recon_files[sname]:
-                        self._seen_recon_files[sname][pname] -= deleted_set
+            delete_fn(first_num, last_num, all_paths)
 
             dlg.accept()
 

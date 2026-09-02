@@ -136,6 +136,10 @@ Extension points
 ``set_scatter_overlay(x, y)`` / ``clear_scatter_overlay()``
     A red scatter layer in image coordinates for host-supplied points.
 
+``clear_image()``
+    Blank the view -- drops the cached array and every overlay, for hosts that
+    would otherwise be left showing a stale image.
+
 ``zoom_to_left_square()``, ``reset_zoom()``, ``set_view_range(**kwargs)``
     Zoom helpers. ``reset_zoom()`` is the programmatic form of "View All"; the
     last is a passthrough to ``ViewBox.setRange``.

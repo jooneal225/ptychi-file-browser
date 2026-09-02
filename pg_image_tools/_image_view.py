@@ -331,6 +331,24 @@ class ImagePlotWidget(QtWidgets.QWidget):
         self._render(autoRange=autoRange)
         self._update_lineout()
 
+    def clear_image(self):
+        """
+        Blank the view: drop the cached array and every overlay.
+
+        For hosts that need an empty plot rather than a stale one, e.g. when
+        the file a selection points at cannot be found. A later ``set_image()``
+        brings the view back as usual.
+        """
+        self._raw_data = None
+        self._displayed_shape = None
+        self._info_base_text = ''
+        self.clear_measure_points(update_lineout=False)
+        self.clear_scatter_overlay()
+        self.pg_view.clear()
+        if self._info_label is not None:
+            self._info_label.setText('')
+        self._update_lineout()
+
     def redraw(self, clear_overlays=False):
         """
         Re-render the cached array after a display-option change.
@@ -367,13 +385,45 @@ class ImagePlotWidget(QtWidgets.QWidget):
             data = gaussian_filter(data, sigma=self._filter_kernel)
 
         if self._log_checked():
-            data = np.log10(np.clip(np.abs(data), a_min=np.finfo(float).eps, a_max=None))
+            # Floor at the smallest value actually present rather than at eps:
+            # detector frames are full of exact zeros, and clipping those to
+            # 2e-16 buries the real signal in the top tenth of an 18-decade
+            # range. Data with no zeros is unaffected.
+            mag = np.abs(data)
+            positive = mag[mag > 0]
+            floor = float(positive.min()) if positive.size else np.finfo(np.float32).tiny
+            data = np.log10(np.clip(mag, a_min=floor, a_max=None))
 
         self.pg_view.setImage(data, autoLevels=True, autoRange=autoRange)
 
         if not self._colorbar_added:
             self.pg_view.ui.histogram.show()
             self._colorbar_added = True
+
+        self._sync_levels(data)
+
+    def _sync_levels(self, data):
+        """
+        Put the color levels and the histogram on the new array's real range.
+
+        ImageView's own autoLevels works off a subsampled min/max, so after a
+        few images the histogram's range and its level region can drift out of
+        agreement with what is on screen. Setting both from the true extremes
+        keeps them in step.
+        """
+        lo, hi = float(np.nanmin(data)), float(np.nanmax(data))
+
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            finite = data[np.isfinite(data)]
+            if finite.size == 0:
+                return
+            lo, hi = float(finite.min()), float(finite.max())
+
+        if hi <= lo:
+            hi = lo + 1.0   # a flat image still needs a non-empty range
+
+        self.pg_view.ui.histogram.setHistogramRange(lo, hi)
+        self.pg_view.setLevels(lo, hi)
 
     def set_title(self, text):
         """Set the title label, eliding each line in the middle. No-op without a label."""
