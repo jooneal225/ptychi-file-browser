@@ -8,18 +8,61 @@ import h5py
 import tifffile
 from PIL import Image
 import time
-from scipy.ndimage import map_coordinates, median_filter, gaussian_filter
 
 from scan_watcher_thread import ScanWatcherThread
+from pg_image_tools import ImagePlotWidget
 
 TREE_CACHE_FILENAME = "ptychi_file_browser_tree_cache.csv"
 
-import pyqtgraph as pg
+# ---- log csv (beamline run log found next to the base path) ----
+LOG_CSV_SCAN_COL = "scan"
+LOG_CSV_SAMPLE_COL = "sample_name"
+LOG_CSV_STEP_COL = "scan_step_size"
+SCAN_BAD_LIST_FILENAME = "scan_bad_list.csv"
+SCAN_BAD_SCAN_COL = "scan"
+SCAN_BAD_FLAG_COL = "is bad"
+RUNTABLE_BAD_HEADER = "bad"
+LOG_CSV_VIEW_COLS = ["scan", "completed", "date", "time", "ExpTime", "n_pos", "phi", "scan_type"]
+
+# scan_step_size motor -> (displayed unit, multiplier from the unit in the csv).
+# Everything not listed here is a real motor, stored in mm and shown in microns.
+LOG_CSV_STEP_UNITS = {
+    "time": ("ms", 1e3),   # csv is seconds
+    "phi": ("deg", 1.0),   # csv is already degrees
+}
+LOG_CSV_STEP_DEFAULT_UNIT = ("um", 1e3)
+
 from PyQt5 import QtWidgets, uic
 from PyQt5.QtWidgets import QApplication, QLabel
 from PyQt5.QtCore import Qt, QSettings, QEvent
-from PyQt5.QtGui import QImage, QPixmap, QColor, QBrush, QFont
+from PyQt5.QtGui import QImage, QPixmap, QColor, QBrush
 
+GOODNESS_COLORS = {
+    'good': QColor(198, 239, 206),       # light green
+    'reanalyze': QColor(255, 235, 156),  # light yellow
+    'bad': QColor(255, 199, 206),        # light red
+}
+
+# Runtable row with a recon file but no scan goodness set yet: paler than 'good'
+RECON_EXISTS_COLOR = QColor(232, 248, 237)
+
+
+
+class RuntableWindow(QtWidgets.QDialog):
+    """
+    Non-blocking runtable viewer. A plain QDialog, except that it is a real
+    window rather than a modal popup and it reports its own closing so the
+    'bad' checkboxes can be written out.
+    """
+
+    def __init__(self, parent, on_close):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.Window)
+        self._on_close = on_close
+
+    def closeEvent(self, event):
+        self._on_close()
+        super().closeEvent(event)
 
 
 class PtychiReconBrowser(QtWidgets.QMainWindow):
@@ -41,6 +84,16 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.scan_goodness = 'unknown'
         self.file_load_path = None
 
+        # ---- log csv state ----
+        self.log_csv_path = None       # Path to the chosen csv
+        self.log_csv_df = None         # full DataFrame, only used by the viewer
+        self.log_csv_ok = False        # the flag gating every log csv feature
+        self._log_sample_by_scan = {}  # "S0042" -> sample name
+        self._log_bad_by_scan = {}     # "S0042" -> bool, mirrors scan_bad_list.csv
+        self._log_csv_stat = None      # (st_mtime, st_size) guard
+        self.runtable_window = None    # non-blocking viewer, kept alive on self
+        self._runtable_updating = False  # guard against itemChanged while rebuilding
+
         self.treeWidget_fileStructure.installEventFilter(self)
 
         self._initialize_empty_data_containers()
@@ -51,6 +104,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.restore_window_size()
         self.load_base_path()
         self.on_base_path_entered()
+        self._set_log_csv_ui()
 
         self.treeWidget_fileStructure.setContextMenuPolicy(Qt.CustomContextMenu)
         self.treeWidget_fileStructure.customContextMenuRequested.connect(self.on_tree_right_click)
@@ -99,245 +153,40 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.pushButton_updateScanGoodness.clicked.connect(self.on_update_scan_goodness)
         self.toolButton_tips.clicked.connect(self.show_secret_features)
         self.pushButton_addScan.clicked.connect(self.on_add_scan_clicked)
+        self.pushButton_viewRuntable.clicked.connect(self.show_runtable_window)
 
 
     def _setup_pyqtgraph_view(self):
         """
-        Embed pyqtgraph ImageView into the placeholder widget.
+        Embed the reusable ImagePlotWidget into the placeholder widget and
+        register the browser-specific right-click menu actions.
+
+        Everything generic (measurement, cursor readout, lineout + resolution
+        metric, filters, zoom) lives in pg_image_tools; only the actions that
+        reach into this app's tree/file state are wired up here.
         """
-        self.pg_view = pg.ImageView()
-
-        # Lineout plot (hidden by default, lives in a splitter below the image)
-        self._lineout_visible = False
-        self._lineout_plot = pg.PlotWidget()
-        self._lineout_plot.setLabel('bottom', 'Distance (µm)')
-        self._lineout_plot.setLabel('left', 'Value')
-        self._lineout_plot.setVisible(False)
-
-        # Resolution metric: two draggable vertical lines + corner text
-        self._lineout_dist_um = None
-        self._lineout_values = None
-        self._res_lines_positioned = False
-        self._res_line1 = pg.InfiniteLine(
-            pos=0.0, angle=90, movable=True,
-            pen=pg.mkPen(color=(80, 120, 255), width=1.5, style=Qt.DotLine)
+        self.plot = ImagePlotWidget(
+            self.graphicsView_1,
+            info_label=self.label_plot_info,
+            title_label=self.label_plot_1,
+            transpose_checkbox=self.checkBox_transpose,
+            log_checkbox=self.checkBox_logCmap,
         )
-        self._res_line2 = pg.InfiniteLine(
-            pos=1.0, angle=90, movable=True,
-            pen=pg.mkPen(color=(80, 220, 80), width=1.5, style=Qt.DotLine)
+        # App-specific menu entries, above the widget's own block
+        self.plot.add_menu_action(
+            "Copy Param Folder Path", self._copy_current_param_path, at_top=True
         )
-        self._res_nm = None
-        self._res_region = None
-        self._res_line1.sigPositionChanged.connect(self._on_res_line_moved)
-        self._res_line2.sigPositionChanged.connect(self._on_res_line_moved)
-        self._res_text_item = pg.TextItem(text='', color='w', anchor=(1, 0),
-                                          fill=pg.mkBrush(0, 0, 0, 180))
-        _res_font = QFont("Courier", 9)
-        self._res_text_item.setFont(_res_font)
-        self._lineout_plot.getViewBox().sigRangeChanged.connect(self._reposition_res_text)
-        # Context menu action for the lineout plot
-        self._find_resolution_action = QtWidgets.QAction(f"Find 25%-75% resolution")
-        self._find_resolution_action.triggered.connect(self._find_resolution)
-        self._lineout_plot.getViewBox().menu.addSeparator()
-        self._lineout_plot.getViewBox().menu.addAction(self._find_resolution_action)
-
-        splitter = QtWidgets.QSplitter(Qt.Vertical)
-        splitter.addWidget(self.pg_view)
-        splitter.addWidget(self._lineout_plot)
-        splitter.setSizes([700, 200])
-
-        self.graphicsView_1_layout = QtWidgets.QVBoxLayout(self.graphicsView_1)
-        self.graphicsView_1_layout.setContentsMargins(0, 0, 0, 0)
-        self.graphicsView_1_layout.addWidget(splitter)
-
-        # --- Measurement overlay ---
-        self._measure_clicks = []  # up to 2 (x, y) pixel-space coords
-
-        self._measure_scatter = pg.ScatterPlotItem(
-            size=12, pen=pg.mkPen('r', width=2), brush=pg.mkBrush(None), symbol='+'
+        self.plot.add_menu_action(
+            "Copy Absolute File Path", self._copy_current_abs_file_path, at_top=True
         )
-        self.pg_view.getView().addItem(self._measure_scatter)
-
-        self._measure_line = pg.PlotCurveItem(
-            pen=pg.mkPen('r', width=1, style=Qt.DashLine)
-        )
-        self.pg_view.getView().addItem(self._measure_line)
-
-        self._distance_text = pg.TextItem(
-            color=(0, 0, 0), anchor=(0.5, 0.5),
-            fill=pg.mkBrush(255, 255, 255, 220),
-        )
-        _font = QFont()
-        _font.setPointSize(10)
-        self._distance_text.textItem.setFont(_font)
-        self.pg_view.getView().addItem(self._distance_text)
-        self._distance_text.setVisible(False)
-
-        # Positions overlay (for _pos choice)
-        self._positions_scatter_overlay = pg.ScatterPlotItem(
-            size=8, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 180)
-        )
-        self._positions_scatter_overlay.setVisible(False)
-        self.pg_view.getView().addItem(self._positions_scatter_overlay)
-
-        # "Copy param folder path" action
-        self._copy_param_path_action = QtWidgets.QAction("Copy Param Folder Path")
-        self._copy_param_path_action.triggered.connect(self._copy_current_param_path)
-        self.pg_view.getView().menu.addAction(self._copy_param_path_action)
-
-        # "Copy absolute file path" action
-        self._copy_abs_file_path_action = QtWidgets.QAction("Copy Absolute File Path")
-        self._copy_abs_file_path_action.triggered.connect(self._copy_current_abs_file_path)
-        self.pg_view.getView().menu.addAction(self._copy_abs_file_path_action)
-        self.pg_view.getView().menu.addSeparator()
-
-        # "Plot Lineout" toggle in the ViewBox right-click menu
-        self._lineout_action = QtWidgets.QAction("Plot Lineout")
-        self._lineout_action.setCheckable(True)
-        self._lineout_action.triggered.connect(self._toggle_lineout)
-        self.pg_view.getView().menu.addSeparator()
-        self.pg_view.getView().menu.addAction(self._lineout_action)
-
-        # "Reset Zoom" action
-        self._reset_zoom_action = QtWidgets.QAction("Reset Zoom")
-        self._reset_zoom_action.triggered.connect(lambda: self.pg_view.getView().autoRange())
-        self.pg_view.getView().menu.addAction(self._reset_zoom_action)
-
-        # "Auto-reset Zoom" toggle — when checked, zoom resets on every new image load
-        self._auto_reset_zoom_action = QtWidgets.QAction("Auto-reset Zoom")
-        self._auto_reset_zoom_action.setCheckable(True)
-        self._auto_reset_zoom_action.setChecked(True)
-        self.pg_view.getView().menu.addAction(self._auto_reset_zoom_action)
+        self.plot.add_menu_separator(at_top=True)
 
         # "Full Probe Zoom" toggle — when checked, skip the square crop zoom
-        self._full_probe_zoom_action = QtWidgets.QAction("Full Probe Zoom")
-        self._full_probe_zoom_action.setCheckable(True)
-        self.pg_view.getView().menu.addAction(self._full_probe_zoom_action)
-
-        # "Analyze" submenu
-        self._active_filter = None   # 'median' | 'gaussian' | None
-        self._filter_kernel = 3.0
-        self._analyze_menu = QtWidgets.QMenu("Analyze")
-        analyze_menu = self._analyze_menu
-        self.pg_view.getView().menu.addSeparator()
-        self.pg_view.getView().menu.addMenu(analyze_menu)
-
-        self._median_filter_action = QtWidgets.QAction("Median Filter")
-        self._median_filter_action.setCheckable(True)
-        self._median_filter_action.triggered.connect(
-            lambda checked: self._set_filter('median', checked)
-        )
-        analyze_menu.addAction(self._median_filter_action)
-
-        self._gaussian_filter_action = QtWidgets.QAction("Gaussian Filter")
-        self._gaussian_filter_action.setCheckable(True)
-        self._gaussian_filter_action.triggered.connect(
-            lambda checked: self._set_filter('gaussian', checked)
-        )
-        analyze_menu.addAction(self._gaussian_filter_action)
-
-        # --- Mouse signals ---
-        self._mouse_move_proxy = pg.SignalProxy(
-            self.pg_view.scene.sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved
-        )
-        self.pg_view.scene.sigMouseClicked.connect(self._on_mouse_clicked)
-
-
-    def _on_mouse_moved(self, event):
-        pos = event[0]  # SignalProxy wraps args in a tuple
-        img_item = self.pg_view.getImageItem()
-        if img_item is None or img_item.image is None:
-            return
-        base = getattr(self, '_info_base_text', '')
-        if img_item.sceneBoundingRect().contains(pos):
-            pt = img_item.mapFromScene(pos)
-            nx, ny = img_item.image.shape[:2]
-            x_um = (pt.x() - nx / 2) * self.res_m * 1e6
-            y_um = (pt.y() - ny / 2) * self.res_m * 1e6
-            xi, yi = int(pt.x()), int(pt.y())
-            if 0 <= xi < nx and 0 <= yi < ny:
-                intens = img_item.image[xi, yi]
-                self.label_plot_info.setText(f"{base}\nx={x_um:.2f}, y={y_um:.2f} µm, I={intens:.2g}")
-            else:
-                self.label_plot_info.setText(f"{base}\nx={x_um:.2f}, y={y_um:.2f} µm")
-        else:
-            self.label_plot_info.setText(base)
-
-
-    def _on_mouse_clicked(self, event):
-        if event.button() != Qt.LeftButton:
-            return
-        pos = event.scenePos()
-        img_item = self.pg_view.getImageItem()
-        if img_item is None or img_item.image is None:
-            return
-        if not img_item.sceneBoundingRect().contains(pos):
-            return
-
-        pt = img_item.mapFromScene(pos)
-        x, y = pt.x(), pt.y()
-
-        if len(self._measure_clicks) == 2:
-            # Third click: clear everything
-            self._measure_clicks = []
-            self._measure_scatter.setData(x=[], y=[])
-            self._measure_line.setData([], [])
-            self._distance_text.setVisible(False)
-            self._update_lineout()
-            return
-
-        self._measure_clicks.append((x, y))
-        self._measure_scatter.setData(
-            x=[p[0] for p in self._measure_clicks],
-            y=[p[1] for p in self._measure_clicks],
+        self._full_probe_zoom_action = self.plot.add_menu_action(
+            "Full Probe Zoom", checkable=True,
+            after=self.plot.action_auto_reset_zoom,
         )
 
-        if len(self._measure_clicks) == 2:
-            x1, y1 = self._measure_clicks[0]
-            x2, y2 = self._measure_clicks[1]
-            dist_um = np.sqrt(
-                ((x2 - x1) * self.res_m * 1e6) ** 2 +
-                ((y2 - y1) * self.res_m * 1e6) ** 2
-            )
-            self._measure_line.setData([x1, x2], [y1, y2])
-            # Offset the label perpendicularly away from the line
-            dx, dy = x2 - x1, y2 - y1
-            seg_len = np.sqrt(dx**2 + dy**2)
-            offset = max(seg_len * 0.07, 30)
-            if seg_len > 0:
-                px, py = -dy / seg_len * offset, dx / seg_len * offset
-            else:
-                px, py = 0, offset
-            self._distance_text.setPos((x1 + x2) / 2 + px, (y1 + y2) / 2 + py)
-            dist_px = int(round(np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)))
-            self._distance_text.setText(f"{dist_um:.3f} µm\n{dist_px} pix")
-            self._distance_text.setVisible(True)
-            self._update_lineout()
-
-
-    def _set_filter(self, filter_type: str, checked: bool):
-        if not checked:
-            self._active_filter = None
-        else:
-            kernel, ok = QtWidgets.QInputDialog.getDouble(
-                self, f"{filter_type.capitalize()} Filter", "Kernel width:",
-                value=self._filter_kernel, min=0.1, max=500.0, decimals=1
-            )
-            if not ok:
-                # User cancelled — revert the checkmark
-                action = self._median_filter_action if filter_type == 'median' else self._gaussian_filter_action
-                action.setChecked(False)
-                return
-            self._filter_kernel = kernel
-            self._active_filter = filter_type
-            # Uncheck the other filter
-            other = self._gaussian_filter_action if filter_type == 'median' else self._median_filter_action
-            other.setChecked(False)
-
-        # Re-display current image with (or without) the filter
-        item = self.treeWidget_fileStructure.currentItem()
-        if item is not None:
-            self.on_tree_item_clicked(item, 2)
 
     def _copy_current_param_path(self):
         item = self.treeWidget_fileStructure.currentItem()
@@ -350,135 +199,6 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         if self.file_load_path is None:
             return
         QApplication.clipboard().setText(str(self.file_load_path))
-
-    def _toggle_lineout(self, checked: bool):
-        self._lineout_visible = checked
-        self._lineout_plot.setVisible(checked)
-        self._update_lineout()
-
-    def _update_lineout(self):
-        if not self._lineout_visible:
-            return
-        self._lineout_plot.clear()
-        self._res_nm = None     # cleared by plot.clear()
-        self._res_region = None
-        if len(self._measure_clicks) < 2:
-            self._lineout_dist_um = None
-            self._lineout_values = None
-            return
-        x1, y1 = self._measure_clicks[0]
-        x2, y2 = self._measure_clicks[1]
-        dist_um, values = self._compute_lineout(x1, y1, x2, y2)
-        if dist_um is not None:
-            self._lineout_dist_um = dist_um
-            self._lineout_values = values
-            self._lineout_plot.plot(dist_um, values, pen=pg.mkPen('w', width=1))
-            marker_pen = pg.mkPen('r', width=1, style=Qt.DashLine)
-            self._lineout_plot.addItem(pg.InfiniteLine(pos=dist_um[0],  angle=90, pen=marker_pen))
-            self._lineout_plot.addItem(pg.InfiniteLine(pos=dist_um[-1], angle=90, pen=marker_pen))
-            # Position metric lines on first use, then keep user-dragged positions
-            if not self._res_lines_positioned:
-                span = dist_um[-1] - dist_um[0]
-                self._res_line1.setPos(dist_um[0] + span / 3)
-                self._res_line2.setPos(dist_um[0] + 2 * span / 3)
-                self._res_lines_positioned = True
-            # Re-add after clear() — ignoreBounds keeps them out of autoscale
-            self._lineout_plot.addItem(self._res_line1, ignoreBounds=True)
-            self._lineout_plot.addItem(self._res_line2, ignoreBounds=True)
-            self._lineout_plot.addItem(self._res_text_item, ignoreBounds=True)
-            self._update_res_metric()
-
-    def _on_res_line_moved(self):
-        """Called when a metric line is dragged — clears any computed resolution."""
-        self._clear_resolution()
-        self._update_res_metric()
-
-    def _clear_resolution(self):
-        if self._res_region is not None:
-            try:
-                self._lineout_plot.removeItem(self._res_region)
-            except Exception:
-                pass
-            self._res_region = None
-        self._res_nm = None
-
-    def _update_res_metric(self):
-        if self._lineout_dist_um is None or self._lineout_values is None:
-            return
-        xb = self._res_line1.value()
-        xg = self._res_line2.value()
-        yb = float(np.interp(xb, self._lineout_dist_um, self._lineout_values))
-        yg = float(np.interp(xg, self._lineout_dist_um, self._lineout_values))
-        delta_x = abs(xg - xb)
-        lines = [
-            f"Blue  X: {xb:.3f} µm",
-            f"Blue  Y: {yb:.4g}",
-            f"Green X: {xg:.3f} µm",
-            f"Green Y: {yg:.4g}",
-            f"ΔX:      {delta_x:.3f} µm",
-        ]
-        if self._res_nm is not None:
-            lines.append(f"Resolution: {self._res_nm} nm")
-        self._res_text_item.setText("\n".join(lines))
-        self._reposition_res_text()
-
-    def _find_resolution(self):
-        if self._lineout_dist_um is None or self._lineout_values is None:
-            return
-        xb = self._res_line1.value()
-        xg = self._res_line2.value()
-        yb = float(np.interp(xb, self._lineout_dist_um, self._lineout_values))
-        yg = float(np.interp(xg, self._lineout_dist_um, self._lineout_values))
-
-        lo, hi = min(xb, xg), max(xb, xg)
-        mask = (self._lineout_dist_um >= lo) & (self._lineout_dist_um <= hi)
-        x_slice = self._lineout_dist_um[mask]
-        y_slice = self._lineout_values[mask]
-        if len(x_slice) < 2:
-            return
-
-        level_25 = yb + 0.25 * (yg - yb)
-        level_75 = yb + 0.75 * (yg - yb)
-
-        # np.interp requires monotonically increasing xp — sort by y value
-        if y_slice[-1] >= y_slice[0]:
-            x_25 = float(np.interp(level_25, y_slice, x_slice))
-            x_75 = float(np.interp(level_75, y_slice, x_slice))
-        else:
-            x_25 = float(np.interp(level_25, y_slice[::-1], x_slice[::-1]))
-            x_75 = float(np.interp(level_75, y_slice[::-1], x_slice[::-1]))
-
-        self._res_nm = int(round(abs(x_75 - x_25) * 1e3))
-
-        # Shade the region between the two crossings
-        self._clear_resolution()   # remove any old region first
-        self._res_region = pg.LinearRegionItem(
-            values=[min(x_25, x_75), max(x_25, x_75)],
-            brush=pg.mkBrush(160, 0, 200, 70),
-            movable=False,
-        )
-        self._lineout_plot.addItem(self._res_region, ignoreBounds=True)
-        self._update_res_metric()
-
-    def _reposition_res_text(self):
-        vr = self._lineout_plot.getViewBox().viewRange()
-        x_min, x_max = vr[0]
-        y_min, y_max = vr[1]
-        mx = (x_max - x_min) * 0.01
-        my = (y_max - y_min) * 0.02
-        self._res_text_item.setPos(x_max - mx, y_max - my)
-
-    def _compute_lineout(self, x1, y1, x2, y2):
-        img = self.pg_view.getImageItem().image
-        if img is None:
-            return None, None
-        n_pts = max(int(np.hypot(x2 - x1, y2 - y1)), 10)
-        xs = np.linspace(x1, x2, n_pts)
-        ys = np.linspace(y1, y2, n_pts)
-        values = map_coordinates(img, [xs, ys], order=1, mode='nearest')
-        total_um = np.hypot((x2 - x1) * self.res_m * 1e6, (y2 - y1) * self.res_m * 1e6)
-        dist_um = np.linspace(0, total_um, n_pts)
-        return dist_um, values
 
 
     # ------------------------------------------------------------------
@@ -551,21 +271,41 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         Plot
         --- Click on two points to get distance and lineout
         --- Open lineout viewer with right-click on plot
-        ----- Lineout viewer can be used to find the 10%-90% resolution
+        ----- Lineout viewer can be used to find the 25%-75% resolution
         ----- Drag the blue and green lines to the boundaries of a hard edge, and the right-click menu will calculate it
         --- By default, probe viewer is centered on mode 0, and the right-click menu can turn this off
         --- Right-click menu can copy parameter folder string (Ndp256...)
-        --- Right-click menu can reset zoom and change default zoom behavior
+        --- Right-click menu can change default zoom behavior ("View All" resets the zoom)
 
         Scan goodness
         --- Row color shows scan goodness, tracked as txt file in scan folder
         --- Green is a good ptycho recon, yellow marks a scan to reanalyze, red is bad data
         
         Sample names
+        --- Taken from the log csv first, then the sources below, then a dash
         --- Pulled from file 'runtable_full_{self.base_path.parent.name}.csv'
         --- File must be located in parent of base path
         --- i.e. {self.base_path.parent}
         --- Searches for scan number in column 'run', and returns corresponding string from 'sample_name'
+
+        Log CSV / Runtable
+        --- On Populate tree or Load tree, searches parent of base path for .csv files
+        --- i.e. {self.base_path.parent}
+        --- If more than one is found, a popup asks which to use, and the choice is remembered
+        --- Must have a 'scan' column of four-digit run numbers, i.e. S0001, or all of this is skipped
+        --- Duplicate scan numbers use the last row in the file
+        --- Column 'sample_name' feeds the sample name column, before the runtable and file name guesses
+        --- Re-read when a brand new scan is added, so scans measured after startup still get info
+        --- File is only ever opened read only, so it never blocks whatever is writing to it
+        --- "View Runtable" opens a filtered, color-coded table in its own window
+        ----- Shows scan, completed, date, time, ExpTime, n_pos, phi, scan_type
+        ----- Then one column per entry in 'scan_step_size', motors in microns, time in ms, phi in deg
+        ----- Row color starts from scan goodness, then pale green if a recon file exists in the tree
+        ----- or yellow if it does not, and finally red if 'completed' is no
+        ----- Far right "bad" checkbox is ticked for every red row, and ticking one turns its row red
+        ----- Ticks are saved to '{SCAN_BAD_LIST_FILENAME}' next to the log csv, as columns 'scan' and 'is bad'
+        ----- That file is written on populate, on refresh, and when either window is closed
+        ----- An 'is bad' of yes forces a row red on reload, so untick a row to take the mark back off
 
         Scan Auto Updater
         --- Every 10.0 s, checks a file {self.base_path / "recon_completed.csv"}
@@ -704,6 +444,10 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         else:
             scan_nums = [first_num]
 
+        # Only pay for a re-read if at least one of these is a brand new row
+        if any(f"S{num:04d}" not in self._scan_row_items for num in scan_nums):
+            self.refresh_log_csv_for_new_scan()
+
         missing = []
         for num in scan_nums:
             scan_name = f"S{num:04d}"
@@ -793,24 +537,9 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
 
     def apply_scan_goodness_style(self, row_item: QtWidgets.QTreeWidgetItem, goodness: str):
-        if goodness == "good":
-            color = QColor(198,239,206)  # light green
-            for col in range(self.treeWidget_fileStructure.columnCount()):
-                row_item.setBackground(col, color)
-
-        elif goodness == "reanalyze":
-            color = QColor(255,235,156)  # light yellow
-            for col in range(self.treeWidget_fileStructure.columnCount()):
-                row_item.setBackground(col, color)
-
-        elif goodness == "bad":
-            color = QColor(255,199,206)  # light red
-            for col in range(self.treeWidget_fileStructure.columnCount()):
-                row_item.setBackground(col, color)
-
-        else:
-            for col in range(self.treeWidget_fileStructure.columnCount()):
-                row_item.setBackground(col, QBrush())
+        color = GOODNESS_COLORS.get(goodness, QBrush())
+        for col in range(self.treeWidget_fileStructure.columnCount()):
+            row_item.setBackground(col, color)
 
 
     # ------------------------------------------------------------------
@@ -850,6 +579,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         if scan_path.name in self._scan_row_items:
             self._refresh_scan_row(scan_path)   # existing → update in place
         else:
+            self.refresh_log_csv_for_new_scan()
             self._add_scan_row(scan_path)       # new → add row
 
 
@@ -884,6 +614,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         settings = QSettings("temp", "PtychiFileBrowser")
+
+        self.save_scan_bad_list()
 
         settings.setValue("window_geometry", self.saveGeometry())
         settings.setValue("window_state", self.saveState())
@@ -1024,12 +756,18 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     def get_sample_name_for_scan(self, scan_path: Path):
         """
         Return sample name for a scan folder S#### if available.
-        Tries runtable first, then falls back to parsing a filename directly.
+        Tries the log csv, then the runtable, then falls back to parsing a
+        filename directly.
         """
         try:
             scan_num = int(scan_path.name[1:])
         except ValueError:
             return None
+
+        # --- log csv lookup ---
+        log_name = self.get_log_csv_sample_name(scan_path.name)
+        if log_name:
+            return log_name
 
         # --- runtable lookup ---
         if self.runtable_df is not None:
@@ -1064,9 +802,633 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
 
     # ------------------------------------------------------------------
+    # log csv
+    # ------------------------------------------------------------------
+
+    def _set_log_csv_ui(self):
+        """Enable the runtable viewer only when a usable log csv is loaded."""
+        self.pushButton_viewRuntable.setEnabled(bool(self.log_csv_ok))
+
+
+    def _clear_log_csv_state(self):
+        self.log_csv_path = None
+        self.log_csv_df = None
+        self.log_csv_ok = False
+        self._log_sample_by_scan = {}
+        self._log_bad_by_scan = {}
+        self._log_csv_stat = None
+
+
+    def _log_csv_stat_tuple(self, path: Path):
+        """(mtime, size) of the csv, or None if it cannot be stat'ed."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_mtime, st.st_size)
+
+
+    def discover_log_csv(self):
+        """
+        Find the log csv in the parent of base_path.
+
+        Reuses the remembered choice when it still applies, otherwise asks
+        the user if more than one candidate exists.
+
+        Returns
+        -------
+        Path or None
+        """
+        if self.base_path is None:
+            return None
+
+        settings = QSettings("temp", "PtychiFileBrowser")
+        remembered_base = settings.value("log_csv_base_path")
+        remembered_csv = settings.value("log_csv_path")
+        if remembered_base == str(self.base_path) and remembered_csv:
+            remembered_csv = Path(remembered_csv)
+            if remembered_csv.exists():
+                return remembered_csv
+
+        try:
+            # Skip the bad list we write ourselves - it has a 'scan' column
+            # too, so it would otherwise pass as a log csv
+            candidates = sorted(
+                p for p in self.base_path.parent.glob("*.csv")
+                if p.name not in (SCAN_BAD_LIST_FILENAME, TREE_CACHE_FILENAME)
+            )
+        except OSError as exc:
+            print(f"Failed to search for log csv: {exc}")
+            return None
+
+        if not candidates:
+            return None
+
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        else:
+            chosen = self._ask_which_log_csv(candidates)
+            if chosen is None:
+                return None
+
+        settings.setValue("log_csv_base_path", str(self.base_path))
+        settings.setValue("log_csv_path", str(chosen))
+        return chosen
+
+
+    def _ask_which_log_csv(self, candidates):
+        """Popup asking which of several csv files to use. None if cancelled."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Select Log CSV")
+        layout = QtWidgets.QVBoxLayout(dlg)
+
+        layout.addWidget(QtWidgets.QLabel(
+            f"Multiple csv files found in:\n{self.base_path.parent}\n\nSelect the run log to use:"
+        ))
+
+        combo = QtWidgets.QComboBox()
+        for path in candidates:
+            combo.addItem(path.name)
+        layout.addWidget(combo)
+
+        button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(dlg.accept)
+        button_box.rejected.connect(dlg.reject)
+        layout.addWidget(button_box)
+
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return None
+
+        return candidates[combo.currentIndex()]
+
+
+    def _rebuild_scan_lookup(self, df):
+        """
+        Build {scan_name -> sample name or None} from a log csv DataFrame.
+
+        Rows are walked in file order so a duplicate scan number keeps the
+        last (highest row number) entry.
+        """
+        lookup = {}
+        scans = df[LOG_CSV_SCAN_COL]
+        samples = df[LOG_CSV_SAMPLE_COL] if LOG_CSV_SAMPLE_COL in df.columns else None
+
+        for i in range(len(df)):
+            scan_key = str(scans.iloc[i]).strip()
+            if not scan_key:
+                continue
+
+            sample = None
+            if samples is not None:
+                value = samples.iloc[i]
+                if pd.notna(value):
+                    sample = str(value).strip() or None
+
+            lookup[scan_key] = sample
+
+        return lookup
+
+
+    def load_log_csv(self):
+        """
+        Locate and fully read the log csv, setting self.log_csv_ok.
+
+        Any failure (no file, unreadable, no 'scan' column) leaves the flag
+        False so every log csv feature is skipped. The file is only opened
+        read-only and closed immediately, so it is never locked.
+
+        Returns
+        -------
+        bool
+        """
+        self._clear_log_csv_state()
+
+        if self.base_path is None:
+            self._set_log_csv_ui()
+            return False
+
+        csv_path = self.discover_log_csv()
+        if csv_path is None:
+            self._set_log_csv_ui()
+            return False
+
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as exc:
+            print(f"Failed to load log csv: {exc}")
+            self._set_log_csv_ui()
+            return False
+
+        if LOG_CSV_SCAN_COL not in df.columns:
+            print(f"Log csv {csv_path.name} has no '{LOG_CSV_SCAN_COL}' column, skipping")
+            self._set_log_csv_ui()
+            return False
+
+        self.log_csv_path = csv_path
+        self.log_csv_df = df
+        self._log_sample_by_scan = self._rebuild_scan_lookup(df)
+        self._log_csv_stat = self._log_csv_stat_tuple(csv_path)
+        self.log_csv_ok = True
+
+        self.load_scan_bad_list()
+
+        self._set_log_csv_ui()
+        print(f"Loaded log csv from {csv_path}")
+        return True
+
+
+    def get_log_csv_sample_name(self, scan_name: str):
+        """Sample name for an S#### scan from the log csv, or None."""
+        if not self.log_csv_ok:
+            return None
+        return self._log_sample_by_scan.get(scan_name)
+
+
+    # ------------------------------------------------------------------
+    # scan bad list
+    # ------------------------------------------------------------------
+
+    @property
+    def scan_bad_list_path(self):
+        """Path of scan_bad_list.csv, alongside the log csv."""
+        if self.log_csv_path is None:
+            return None
+        return self.log_csv_path.parent / SCAN_BAD_LIST_FILENAME
+
+
+    def load_scan_bad_list(self):
+        """
+        Read scan_bad_list.csv into self._log_bad_by_scan. A missing or
+        unreadable file just leaves the mapping empty; it gets created by
+        the next save.
+        """
+        self._log_bad_by_scan = {}
+
+        path = self.scan_bad_list_path
+        if path is None or not path.exists():
+            return
+
+        try:
+            df = pd.read_csv(path)
+        except Exception as exc:
+            print(f"Failed to load {SCAN_BAD_LIST_FILENAME}: {exc}")
+            return
+
+        if SCAN_BAD_SCAN_COL not in df.columns or SCAN_BAD_FLAG_COL not in df.columns:
+            print(f"{SCAN_BAD_LIST_FILENAME} has unexpected columns, ignoring")
+            return
+
+        for scan, flag in zip(df[SCAN_BAD_SCAN_COL], df[SCAN_BAD_FLAG_COL]):
+            scan_key = str(scan).strip()
+            if scan_key:
+                self._log_bad_by_scan[scan_key] = str(flag).strip().lower() == "yes"
+
+
+    def _log_completed_by_scan(self):
+        """{scan -> completed} from the full log csv frame, last duplicate wins."""
+        completed = {}
+        df = self.log_csv_df
+        if df is None or "completed" not in df.columns:
+            return completed
+
+        for scan, value in zip(df[LOG_CSV_SCAN_COL], df["completed"]):
+            scan_key = str(scan).strip()
+            if scan_key:
+                completed[scan_key] = None if pd.isna(value) else value
+        return completed
+
+
+    def _refresh_bad_state_from_colors(self):
+        """
+        Re-derive 'is bad' for every scan in the log csv from its current
+        runtable color, so the saved list always mirrors the checkboxes.
+        """
+        completed = self._log_completed_by_scan()
+        for scan_key in self._log_sample_by_scan:
+            color = self._runtable_row_color(
+                scan_key,
+                completed.get(scan_key),
+                marked_bad=self._log_bad_by_scan.get(scan_key, False),
+            )
+            self._log_bad_by_scan[scan_key] = color == GOODNESS_COLORS['bad']
+
+
+    def save_scan_bad_list(self):
+        """
+        Write scan_bad_list.csv next to the log csv, creating it if it does
+        not exist yet. Called after the tree is built, when the runtable is
+        refreshed or closed, and when the main window closes.
+        """
+        if not self.log_csv_ok:
+            return
+
+        path = self.scan_bad_list_path
+        if path is None:
+            return
+
+        self._refresh_bad_state_from_colors()
+
+        rows = [
+            {SCAN_BAD_SCAN_COL: scan_key,
+             SCAN_BAD_FLAG_COL: "yes" if self._log_bad_by_scan.get(scan_key) else "no"}
+            for scan_key in self._log_sample_by_scan
+        ]
+
+        try:
+            pd.DataFrame(rows, columns=[SCAN_BAD_SCAN_COL, SCAN_BAD_FLAG_COL]).to_csv(
+                path, index=False
+            )
+        except Exception as exc:
+            print(f"Failed to save {SCAN_BAD_LIST_FILENAME}: {exc}")
+            return
+
+        print(f"Saved scan bad list to {path}")
+
+
+    def refresh_log_csv_for_new_scan(self):
+        """
+        Cheap re-read used when a brand new scan row is added, so scans
+        measured after the csv was last read still pick up their info.
+
+        Stats the file first and does no I/O at all when it has not changed.
+        Otherwise only the scan and sample_name columns are parsed; the full
+        frame behind the runtable viewer is refreshed only if that window is
+        currently open.
+        """
+        if not self.log_csv_ok or self.log_csv_path is None:
+            return
+
+        stat = self._log_csv_stat_tuple(self.log_csv_path)
+        if stat is None or stat == self._log_csv_stat:
+            return
+
+        viewer_open = self.runtable_window is not None and self.runtable_window.isVisible()
+
+        try:
+            if viewer_open:
+                df = pd.read_csv(self.log_csv_path)
+            else:
+                df = pd.read_csv(
+                    self.log_csv_path,
+                    usecols=lambda c: c in (LOG_CSV_SCAN_COL, LOG_CSV_SAMPLE_COL),
+                )
+        except Exception as exc:
+            print(f"Failed to re-read log csv: {exc}")
+            return
+
+        if LOG_CSV_SCAN_COL not in df.columns:
+            return
+
+        self._log_sample_by_scan = self._rebuild_scan_lookup(df)
+        self._log_csv_stat = stat
+
+        if viewer_open:
+            self.log_csv_df = df
+            self._rebuild_runtable_table()
+
+
+    def reload_log_csv_full(self):
+        """Full re-read of the already-chosen log csv (viewer Refresh button)."""
+        if not self.log_csv_ok or self.log_csv_path is None:
+            return
+
+        try:
+            df = pd.read_csv(self.log_csv_path)
+        except Exception as exc:
+            print(f"Failed to reload log csv: {exc}")
+            return
+
+        if LOG_CSV_SCAN_COL not in df.columns:
+            return
+
+        self.log_csv_df = df
+        self._log_sample_by_scan = self._rebuild_scan_lookup(df)
+        self._log_csv_stat = self._log_csv_stat_tuple(self.log_csv_path)
+
+
+    # ------------------------------------------------------------------
+    # runtable viewer
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_scan_step_size(text):
+        """
+        Parse a scan_step_size entry into {name: value in display units}.
+
+        The entry is a space separated list of (name, step size) pairs, e.g.
+        "X 0.000500 Z 0.000500" -> {"X": 0.5, "Z": 0.5}. Motors are stored in
+        mm and shown in microns; the exceptions in LOG_CSV_STEP_UNITS ('time'
+        in seconds shown as ms, 'phi' already in degrees) get their own
+        conversion. Malformed pairs are skipped rather than raising.
+        """
+        if text is None or (isinstance(text, float) and pd.isna(text)):
+            return {}
+
+        tokens = str(text).split()
+        steps = {}
+        for i in range(0, len(tokens) - 1, 2):
+            name = tokens[i]
+            _, scale = LOG_CSV_STEP_UNITS.get(name, LOG_CSV_STEP_DEFAULT_UNIT)
+            try:
+                steps[name] = float(tokens[i + 1]) * scale
+            except ValueError:
+                continue
+        return steps
+
+
+    @staticmethod
+    def _step_column_header(name):
+        """Column header for one scan_step_size entry, e.g. 'X (um)'."""
+        unit, _ = LOG_CSV_STEP_UNITS.get(name, LOG_CSV_STEP_DEFAULT_UNIT)
+        return f"{name} ({unit})"
+
+
+    def _runtable_columns(self, df):
+        """
+        Return (headers, step_motors) for the viewer.
+
+        headers is the subset of LOG_CSV_VIEW_COLS present in the file, in
+        that order, followed by one column per name found in scan_step_size
+        (first-seen order).
+        """
+        headers = [c for c in LOG_CSV_VIEW_COLS if c in df.columns]
+
+        step_motors = []
+        if LOG_CSV_STEP_COL in df.columns:
+            for value in df[LOG_CSV_STEP_COL]:
+                for motor in self._parse_scan_step_size(value):
+                    if motor not in step_motors:
+                        step_motors.append(motor)
+
+        return headers + [self._step_column_header(m) for m in step_motors], step_motors
+
+
+    def _runtable_row_color(self, scan_key, completed_value, marked_bad=False):
+        """
+        Row color for the runtable, applied in increasing precedence:
+        scan goodness, then whether a recon file exists, then not completed,
+        and finally the manual 'bad' checkbox / scan_bad_list.csv. Note that
+        an 'is bad' of no never clears a color the other rules produced.
+        """
+        row_item = self._scan_row_items.get(scan_key)
+
+        color = None
+        if row_item is not None:
+            goodness = row_item.data(0, Qt.UserRole + 1)
+            color = GOODNESS_COLORS.get(goodness)
+
+        # No recon file in the tree (including scans absent from the tree)
+        if row_item is None or not isinstance(row_item.data(2, Qt.UserRole), Path):
+            color = GOODNESS_COLORS['reanalyze']
+        elif color is None:
+            # Analyzed, but no scan goodness set yet
+            color = RECON_EXISTS_COLOR
+
+        if completed_value is not None and str(completed_value).strip().lower() == "no":
+            color = GOODNESS_COLORS['bad']
+
+        if marked_bad:
+            color = GOODNESS_COLORS['bad']
+
+        return color
+
+
+    def _rebuild_runtable_table(self):
+        """Refill the runtable viewer's table from self.log_csv_df."""
+        table = self.tableWidget_runtable
+        df = self.log_csv_df
+
+        self.label_runtablePath.setText(str(self.log_csv_path or ""))
+        self.label_runtablePath.setToolTip(str(self.log_csv_path or ""))
+
+        self._runtable_updating = True
+        try:
+            table.setSortingEnabled(False)
+            table.clear()
+
+            if df is None:
+                table.setRowCount(0)
+                table.setColumnCount(0)
+                return
+
+            headers, step_motors = self._runtable_columns(df)
+            plain_cols = len(headers) - len(step_motors)
+            bad_col = len(headers)
+
+            table.setColumnCount(len(headers) + 1)
+            table.setHorizontalHeaderLabels(headers + [RUNTABLE_BAD_HEADER])
+            table.setRowCount(len(df))
+
+            completed = df["completed"] if "completed" in df.columns else None
+            scans = df[LOG_CSV_SCAN_COL]
+
+            for row in range(len(df)):
+                for col in range(plain_cols):
+                    value = df[headers[col]].iloc[row]
+                    table.setItem(row, col, self._make_runtable_item(value))
+
+                if step_motors:
+                    steps = self._parse_scan_step_size(df[LOG_CSV_STEP_COL].iloc[row])
+                    for offset, motor in enumerate(step_motors):
+                        table.setItem(row, plain_cols + offset,
+                                      self._make_runtable_item(steps.get(motor)))
+
+                scan_key = str(scans.iloc[row]).strip()
+                completed_value = None if completed is None else completed.iloc[row]
+                if completed_value is not None and pd.isna(completed_value):
+                    completed_value = None
+
+                color = self._runtable_row_color(
+                    scan_key,
+                    completed_value,
+                    marked_bad=self._log_bad_by_scan.get(scan_key, False),
+                )
+                is_bad = color == GOODNESS_COLORS['bad']
+                self._log_bad_by_scan[scan_key] = is_bad
+
+                table.setItem(row, bad_col,
+                              self._make_runtable_bad_item(scan_key, completed_value, is_bad))
+                self._color_runtable_row(row, color)
+
+            table.setSortingEnabled(True)
+            table.resizeColumnsToContents()
+        finally:
+            self._runtable_updating = False
+
+
+    def _color_runtable_row(self, row, color):
+        """Paint every cell of one runtable row, including the checkbox cell."""
+        table = self.tableWidget_runtable
+        brush = color if color is not None else QBrush()
+        for col in range(table.columnCount()):
+            item = table.item(row, col)
+            if item is not None:
+                item.setBackground(brush)
+
+
+    def _make_runtable_bad_item(self, scan_key, completed_value, is_bad):
+        """
+        The 'bad' cell: a bare checkbox. The scan and its completed value ride
+        along on the item so a toggle still works after the table is sorted.
+        """
+        item = QtWidgets.QTableWidgetItem()
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if is_bad else Qt.Unchecked)
+        item.setTextAlignment(Qt.AlignCenter)
+        item.setData(Qt.UserRole, scan_key)
+        item.setData(Qt.UserRole + 1,
+                     None if completed_value is None else str(completed_value))
+        return item
+
+
+    def _on_runtable_item_changed(self, item):
+        """
+        Handle a manual toggle of the 'bad' checkbox: recolor the row and
+        remember the choice. Checking always turns the row red; unchecking
+        only clears it if no other rule was making it red, in which case the
+        box snaps back so it always agrees with the color.
+        """
+        if self._runtable_updating:
+            return
+        if item.column() != self.tableWidget_runtable.columnCount() - 1:
+            return
+
+        scan_key = item.data(Qt.UserRole)
+        checked = item.checkState() == Qt.Checked
+
+        color = self._runtable_row_color(
+            scan_key, item.data(Qt.UserRole + 1), marked_bad=checked
+        )
+        is_bad = color == GOODNESS_COLORS['bad']
+        self._log_bad_by_scan[scan_key] = is_bad
+
+        self._runtable_updating = True
+        try:
+            if is_bad != checked:
+                item.setCheckState(Qt.Checked if is_bad else Qt.Unchecked)
+            self._color_runtable_row(item.row(), color)
+        finally:
+            self._runtable_updating = False
+
+
+    @staticmethod
+    def _make_runtable_item(value):
+        """
+        Table cell for one value. Numbers go in as numbers so that sorting
+        by a numeric column is numeric rather than lexicographic.
+        """
+        item = QtWidgets.QTableWidgetItem()
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            return item
+
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            item.setData(Qt.EditRole, float(value))
+        else:
+            item.setData(Qt.EditRole, str(value))
+
+        return item
+
+
+    def show_runtable_window(self):
+        """
+        Open the runtable viewer: a non-blocking, color-coded view of the
+        log csv. The window is created once and reused so it can refresh
+        itself while open.
+        """
+        if not self.log_csv_ok:
+            return
+
+        if self.runtable_window is None:
+            dlg = RuntableWindow(self, self.save_scan_bad_list)
+            dlg.setWindowTitle("Runtable")
+
+            layout = QtWidgets.QVBoxLayout(dlg)
+
+            self.label_runtablePath = QtWidgets.QLabel()
+            self.label_runtablePath.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            layout.addWidget(self.label_runtablePath)
+
+            self.tableWidget_runtable = QtWidgets.QTableWidget()
+            self.tableWidget_runtable.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+            self.tableWidget_runtable.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+            self.tableWidget_runtable.verticalHeader().setVisible(False)
+            self.tableWidget_runtable.itemChanged.connect(self._on_runtable_item_changed)
+            layout.addWidget(self.tableWidget_runtable)
+
+            btn_row = QtWidgets.QHBoxLayout()
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.clicked.connect(dlg.close)
+            refresh_btn = QtWidgets.QPushButton("Refresh")
+            refresh_btn.clicked.connect(self.on_runtable_refresh)
+            btn_row.addWidget(close_btn)
+            btn_row.addWidget(refresh_btn)
+            btn_row.addStretch()
+            layout.addLayout(btn_row)
+
+            dlg.resize(1000, 600)
+            self.runtable_window = dlg
+
+        self._rebuild_runtable_table()
+        self.runtable_window.show()
+        self.runtable_window.raise_()
+        self.runtable_window.activateWindow()
+
+
+    def on_runtable_refresh(self):
+        """Persist the current checkboxes, then re-read the log csv and rebuild."""
+        self.save_scan_bad_list()
+        self.reload_log_csv_full()
+        self._rebuild_runtable_table()
+
+
+    # ------------------------------------------------------------------
     # data loading
     # ------------------------------------------------------------------
-    
+
 
     def load_data_from_file(self, file_path: Path):
         """
@@ -1141,65 +1503,18 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     # plotting
     # ------------------------------------------------------------------
 
-    def set_plot_label(self, scan: str, sample_name: str, file_path: str):
-        full_text = f"{scan}, {sample_name}\n{file_path}"
-
-        # Elide long lines
-        elide_width = 500  # pixels, adjust to fit your layout
-        metrics = self.label_plot_1.fontMetrics()
-        lines = full_text.split("\n")
-        elided_lines = [metrics.elidedText(line, Qt.ElideMiddle, elide_width) for line in lines]
-        elided_text = "\n".join(elided_lines)
-
-        self.label_plot_1.setText(elided_text)
-        self.label_plot_1.setToolTip(full_text)
-
-
     def display_data(self, data: np.ndarray, scan: int, sample_name: str):
         """
-        Display a 2D numpy array using pyqtgraph.
+        Hand a 2D numpy array to the plot widget.
+
+        Everything below this point (transpose, filters, log scale, overlays,
+        readouts) is the plot widget's business — see pg_image_tools.
         """
         if data.ndim != 2:
             raise ValueError("display_data expects a 2D numpy array")
 
-        # Update title label
-        # self.label_plot_1.setText("%s, %s\n%s" % (scan, sample_name, self.file_load_path))
-        self.set_plot_label(scan, sample_name, str(self.file_load_path))
-
-
-        # Convert to float32 for pyqtgraph
-        data = data.astype(np.float32).T if self.checkBox_transpose.isChecked() else data.astype(np.float32)
-        self._displayed_shape = data.shape  # (nx, ny) in pyqtgraph convention
-
-        # Clear measurement overlay (pixel coords are image-specific)
-        self._measure_clicks = []
-        self._measure_scatter.setData(x=[], y=[])
-        self._measure_line.setData([], [])
-        self._distance_text.setVisible(False)
-        self._update_lineout()
-
-        # Update image info label
-        pix_size_nm = round(self.res_m * 1e9)
-        self._info_base_text = "%.2f\u00d7%.2f µm, %d nm pix" % (data.shape[0] * self.res_m * 1e6, data.shape[1] * self.res_m * 1e6, pix_size_nm)
-        self.label_plot_info.setText(self._info_base_text)
-
-        # Apply filter
-        if self._active_filter == 'median':
-            data = median_filter(data, size=max(1, int(self._filter_kernel)))
-        elif self._active_filter == 'gaussian':
-            data = gaussian_filter(data, sigma=self._filter_kernel)
-
-        # Display
-        auto_range = self._auto_reset_zoom_action.isChecked()
-        if self.checkBox_logCmap.isChecked():
-            self.pg_view.setImage(np.log10(np.clip(np.abs(data), a_min=np.finfo(float).eps, a_max=None)), autoLevels=True, autoRange=auto_range)
-        else:
-            self.pg_view.setImage(data, autoLevels=True, autoRange=auto_range)
-
-        # Enable colorbar
-        if not hasattr(self, "_colorbar_added"):
-            self.pg_view.ui.histogram.show()
-            self._colorbar_added = True
+        self.plot.set_title(f"{scan}, {sample_name}\n{self.file_load_path}")
+        self.plot.set_image(data, pixel_size_m=self.res_m)
 
 
     # New handler
@@ -1241,25 +1556,20 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         extension = self.comboBox_imageChoice.currentText()
         if extension != 'init_probe_mag.tiff' and not extension.startswith('probe_mag'):
             return
-        shape = getattr(self, '_displayed_shape', None)
-        if shape is None:
-            return
-        ny = shape[1]  # vertical height H
         # Leftmost square: x in [0, H], y in [0, H]
-        self.pg_view.getView().setRange(xRange=(0, ny), yRange=(0, ny), padding=0.05)
+        self.plot.zoom_to_left_square()
 
 
     def _update_positions_overlay(self):
         """Show scan positions as a red scatter overlay (only for _pos choice)."""
         pos = getattr(self, '_positions_px', None)
         if pos is None or len(pos) == 0:
-            self._positions_scatter_overlay.setVisible(False)
+            self.plot.clear_scatter_overlay()
             return
         # positions_px is (N, 2) in (row, col) = (y, x) convention stored as
         # offsets from center; shift to image center in pyqtgraph (axis 0 = x, axis 1 = y)
-        nx, ny = getattr(self, '_displayed_shape', (0, 0))
-        self._positions_scatter_overlay.setData(x=pos[:, 1] + nx / 2, y=pos[:, 0] + ny / 2)
-        self._positions_scatter_overlay.setVisible(True)
+        nx, ny = self.plot.displayed_shape or (0, 0)
+        self.plot.set_scatter_overlay(x=pos[:, 1] + nx / 2, y=pos[:, 0] + ny / 2)
 
 
     def on_tree_right_click(self, pos):
@@ -1546,7 +1856,9 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         if self.base_path is None:
             return
-        
+
+        self.load_log_csv()
+
         t0 = time.time()
         self.treeWidget_fileStructure.setUpdatesEnabled(False)
         for i, scan_path in enumerate(self.iter_scan_folders()):
@@ -1574,6 +1886,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.treeWidget_fileStructure.resizeColumnToContents(2)
         # self.treeWidget_fileStructure.setUpdatesEnabled(False)
         self.save_tree_to_csv()
+        self.save_scan_bad_list()
         print(time.time() - t0, 's')
 
         self._set_scan_watcher_ui('stopped')
@@ -1685,6 +1998,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Failed to load tree cache", str(exc))
             return
 
+        self.load_log_csv()
+
         self._initialize_empty_data_containers()
         self.treeWidget_fileStructure.clear()
         self.treeWidget_fileStructure.setUpdatesEnabled(False)
@@ -1697,7 +2012,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
             first = scan_rows.iloc[0]
             scan_goodness = first['scan_goodness'] or 'unknown'
-            sample_name = first['sample_name']
+            # Prefer the log csv over whatever was cached when the tree was saved
+            sample_name = self.get_log_csv_sample_name(scan_name) or first['sample_name']
 
             row_item = QtWidgets.QTreeWidgetItem(self.treeWidget_fileStructure)
             self._scan_row_items[scan_name] = row_item
@@ -1747,6 +2063,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.treeWidget_fileStructure.resizeColumnToContents(0)
         self.treeWidget_fileStructure.resizeColumnToContents(2)
         self.treeWidget_fileStructure.sortItems(0, Qt.AscendingOrder)
+        self.save_scan_bad_list()
         self._set_scan_watcher_ui('stopped')
         print(f"Loaded tree cache from {csv_path}")
 
@@ -2120,6 +2437,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.lineEdit_basePath.setText(str(path))
 
         self.runtable_df = self.load_runtable()
+
+        # The log csv lives next to the base path, so the old one no longer
+        # applies. It is only re-read on populate/load tree, not here.
+        self._clear_log_csv_state()
+        self._set_log_csv_ui()
 
         self._set_scan_watcher_ui('gray')
         self.save_base_path()

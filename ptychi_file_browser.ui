@@ -314,6 +314,24 @@
          </widget>
         </item>
         <item>
+         <widget class="QPushButton" name="pushButton_viewRuntable">
+          <property name="enabled">
+           <bool>false</bool>
+          </property>
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
+          <property name="toolTip">
+           <string>Show the log csv as a color-coded table</string>
+          </property>
+          <property name="text">
+           <string>View Runtable</string>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="QCheckBox" name="checkBox_transpose">
           <property name="font">
            <font>
