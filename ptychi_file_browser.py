@@ -12,6 +12,8 @@ from scipy.ndimage import map_coordinates, median_filter, gaussian_filter
 
 from scan_watcher_thread import ScanWatcherThread
 
+TREE_CACHE_FILENAME = "ptychi_file_browser_tree_cache.csv"
+
 import pyqtgraph as pg
 from PyQt5 import QtWidgets, uic
 from PyQt5.QtWidgets import QApplication, QLabel
@@ -54,6 +56,10 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.treeWidget_fileStructure.customContextMenuRequested.connect(self.on_tree_right_click)
 
 
+    # ------------------------------------------------------------------
+    # initialization
+    # ------------------------------------------------------------------
+
     def _initialize_empty_data_containers(self):
         self._scan_row_items = {}     # scan_name -> QTreeWidgetItem
         self._seen_scans = set()      # just scan names
@@ -84,7 +90,9 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         """Wire UI signals (empty handlers for now)."""
         self.lineEdit_basePath.returnPressed.connect(self.on_base_path_entered)
         self.pushButton_browseBasePath.clicked.connect(self.on_browse_base_path)
-        self.pushButton_populateTree.clicked.connect(self.populate_tree_with_scans)
+        self.pushButton_populateTree.clicked.connect(self.on_populate_tree_clicked)
+        self.pushButton_saveTree.clicked.connect(self.on_save_tree_clicked)
+        self.pushButton_loadTree.clicked.connect(self.on_load_tree_clicked)
         self.treeWidget_fileStructure.itemClicked.connect(self.on_tree_item_clicked)
         self.treeWidget_fileStructure.currentItemChanged.connect(self.on_tree_selection_changed)
         self.pushButton_stopScanUpdate.clicked.connect(self.on_stop_scan_update)
@@ -128,7 +136,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._res_text_item.setFont(_res_font)
         self._lineout_plot.getViewBox().sigRangeChanged.connect(self._reposition_res_text)
         # Context menu action for the lineout plot
-        self._find_resolution_action = QtWidgets.QAction("Find 10%-90% resolution")
+        self._find_resolution_action = QtWidgets.QAction(f"Find 25%-75% resolution")
         self._find_resolution_action.triggered.connect(self._find_resolution)
         self._lineout_plot.getViewBox().menu.addSeparator()
         self._lineout_plot.getViewBox().menu.addAction(self._find_resolution_action)
@@ -176,6 +184,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._copy_param_path_action = QtWidgets.QAction("Copy Param Folder Path")
         self._copy_param_path_action.triggered.connect(self._copy_current_param_path)
         self.pg_view.getView().menu.addAction(self._copy_param_path_action)
+
+        # "Copy absolute file path" action
+        self._copy_abs_file_path_action = QtWidgets.QAction("Copy Absolute File Path")
+        self._copy_abs_file_path_action.triggered.connect(self._copy_current_abs_file_path)
+        self.pg_view.getView().menu.addAction(self._copy_abs_file_path_action)
         self.pg_view.getView().menu.addSeparator()
 
         # "Plot Lineout" toggle in the ViewBox right-click menu
@@ -333,6 +346,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         param_path = Path(item.data(1, Qt.UserRole)).name
         QApplication.clipboard().setText(str(param_path))
 
+    def _copy_current_abs_file_path(self):
+        if self.file_load_path is None:
+            return
+        QApplication.clipboard().setText(str(self.file_load_path))
+
     def _toggle_lineout(self, checked: bool):
         self._lineout_visible = checked
         self._lineout_plot.setVisible(checked)
@@ -419,24 +437,23 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         if len(x_slice) < 2:
             return
 
-        level_10 = yb + 0.1 * (yg - yb)
-        level_90 = yb + 0.9 * (yg - yb)
+        level_25 = yb + 0.25 * (yg - yb)
+        level_75 = yb + 0.75 * (yg - yb)
 
         # np.interp requires monotonically increasing xp — sort by y value
         if y_slice[-1] >= y_slice[0]:
-            x_10 = float(np.interp(level_10, y_slice, x_slice))
-            x_90 = float(np.interp(level_90, y_slice, x_slice))
+            x_25 = float(np.interp(level_25, y_slice, x_slice))
+            x_75 = float(np.interp(level_75, y_slice, x_slice))
         else:
-            x_10 = float(np.interp(level_10, y_slice[::-1], x_slice[::-1]))
-            x_90 = float(np.interp(level_90, y_slice[::-1], x_slice[::-1]))
+            x_25 = float(np.interp(level_25, y_slice[::-1], x_slice[::-1]))
+            x_75 = float(np.interp(level_75, y_slice[::-1], x_slice[::-1]))
 
-        self._res_nm = int(round(abs(x_90 - x_10) * 1e3))
+        self._res_nm = int(round(abs(x_75 - x_25) * 1e3))
 
         # Shade the region between the two crossings
         self._clear_resolution()   # remove any old region first
-        self._res_nm = int(round(abs(x_90 - x_10) * 1e3))
         self._res_region = pg.LinearRegionItem(
-            values=[min(x_10, x_90), max(x_10, x_90)],
+            values=[min(x_25, x_75), max(x_25, x_75)],
             brush=pg.mkBrush(160, 0, 200, 70),
             movable=False,
         )
@@ -577,15 +594,43 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         btn_row = QtWidgets.QHBoxLayout()
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(dlg.accept)
+        fontSize_label = QtWidgets.QLabel("Font Size:")
+        self.comboBox_fontSize = QtWidgets.QComboBox()
+        self.comboBox_fontSize.addItems([str(s) for s in [6, 7, 8, 9, 10, 11, 12, 14, 16, 18, 20, 24]])
+        self.comboBox_fontSize.setCurrentText("10")
+        self.comboBox_fontSize.currentTextChanged.connect(self.on_font_size_changed)
         del_tool_btn = QtWidgets.QPushButton("Delete intermediate reconstructions tool")
         del_tool_btn.setStyleSheet("background-color: red; color: white;")
         del_tool_btn.clicked.connect(lambda: (dlg.accept(), self.show_delete_intermediate_tool()))
         btn_row.addWidget(close_btn)
+        btn_row.addWidget(fontSize_label)
+        btn_row.addWidget(self.comboBox_fontSize)
         btn_row.addWidget(del_tool_btn)
         layout.addLayout(btn_row)
 
         dlg.resize(700, 400)
         dlg.exec()
+
+
+    def on_font_size_changed(self, size_str):
+        """
+        Change the font size of every widget in the entire GUI (all open windows/dialogs).
+        """
+        try:
+            size = int(size_str)
+        except ValueError:
+            return
+
+        app = QApplication.instance()
+
+        app_font = app.font()
+        app_font.setPointSize(size)
+        app.setFont(app_font)
+
+        for widget in app.allWidgets():
+            widget_font = widget.font()
+            widget_font.setPointSize(size)
+            widget.setFont(widget_font)
 
 
     def on_add_scan_clicked(self):
@@ -1467,6 +1512,31 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                     yield Path(entry.path)
 
 
+    def on_populate_tree_clicked(self):
+        """
+        Handler for pushButton_populateTree. If a tree cache already exists
+        for base_path, ask the user whether to load it (fast) or re-walk
+        the filesystem (slow, but authoritative).
+        """
+        if self.base_path is not None and (self.base_path / TREE_CACHE_FILENAME).exists():
+            dlg = QtWidgets.QMessageBox(self)
+            dlg.setWindowTitle("Populate Tree")
+            dlg.setText("Do you want to load the cached files, or read the file structure directly?")
+            load_btn = dlg.addButton("Load cached files", QtWidgets.QMessageBox.AcceptRole)
+            read_btn = dlg.addButton("Read file structure", QtWidgets.QMessageBox.DestructiveRole)
+            dlg.setDefaultButton(load_btn)
+            dlg.exec_()
+
+            clicked = dlg.clickedButton()
+            if clicked is load_btn:
+                self.load_tree_from_csv()
+                return
+            elif clicked is not read_btn:
+                return  # dialog dismissed without a choice
+
+        self.populate_tree_with_scans()
+
+
     def populate_tree_with_scans(self):
         """
         Depth-first population of the tree.
@@ -1503,9 +1573,182 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.treeWidget_fileStructure.resizeColumnToContents(0)
         self.treeWidget_fileStructure.resizeColumnToContents(2)
         # self.treeWidget_fileStructure.setUpdatesEnabled(False)
+        self.save_tree_to_csv()
         print(time.time() - t0, 's')
 
         self._set_scan_watcher_ui('stopped')
+
+
+    # ------------------------------------------------------------------
+    # tree cache (save/load)
+    # ------------------------------------------------------------------
+
+    def on_save_tree_clicked(self):
+        if not self._seen_scans:
+            return
+        self.save_tree_to_csv()
+
+    def on_load_tree_clicked(self):
+        self.load_tree_from_csv()
+
+    def save_tree_to_csv(self):
+        """
+        Flatten the current tree state to a long-format CSV (one row per
+        scan/param-folder/recon-file triple) in base_path, so it can be
+        reloaded later without re-walking the filesystem.
+        """
+        if self.base_path is None:
+            return
+
+        rows = []
+        for scan_name in sorted(self._seen_scans):
+            row_item = self._scan_row_items.get(scan_name)
+            if row_item is None:
+                continue
+
+            scan_goodness = row_item.data(0, Qt.UserRole + 1) or 'unknown'
+            sample_name = row_item.text(3)
+            current_param = row_item.data(1, Qt.UserRole)
+            current_recon = row_item.data(2, Qt.UserRole)
+
+            param_folders = sorted(self._seen_param_folders.get(scan_name, set()))
+
+            if not param_folders:
+                rows.append({
+                    'scan_name': scan_name,
+                    'scan_goodness': scan_goodness,
+                    'sample_name': sample_name,
+                    'param_folder': '',
+                    'is_current_param': 0,
+                    'recon_file': '',
+                    'is_current_recon': 0,
+                })
+                continue
+
+            for param_path in param_folders:
+                is_current_param = int(param_path == current_param)
+                recon_files = sorted(
+                    self._seen_recon_files.get(scan_name, {}).get(param_path.name, set()),
+                    key=self._recon_sort_key,
+                )
+
+                if not recon_files:
+                    rows.append({
+                        'scan_name': scan_name,
+                        'scan_goodness': scan_goodness,
+                        'sample_name': sample_name,
+                        'param_folder': param_path.name,
+                        'is_current_param': is_current_param,
+                        'recon_file': '',
+                        'is_current_recon': 0,
+                    })
+                    continue
+
+                for recon_file in recon_files:
+                    rows.append({
+                        'scan_name': scan_name,
+                        'scan_goodness': scan_goodness,
+                        'sample_name': sample_name,
+                        'param_folder': param_path.name,
+                        'is_current_param': is_current_param,
+                        'recon_file': recon_file.name,
+                        'is_current_recon': int(is_current_param and recon_file == current_recon),
+                    })
+
+        csv_path = self.base_path / TREE_CACHE_FILENAME
+        pd.DataFrame(rows, columns=[
+            'scan_name', 'scan_goodness', 'sample_name',
+            'param_folder', 'is_current_param',
+            'recon_file', 'is_current_recon',
+        ]).to_csv(csv_path, index=False)
+        print(f"Saved tree cache to {csv_path}")
+
+    def load_tree_from_csv(self):
+        """
+        Rebuild the tree and its bookkeeping dicts purely from the CSV
+        cache — no filesystem access beyond reading the CSV itself.
+        """
+        if self.base_path is None:
+            return
+
+        csv_path = self.base_path / TREE_CACHE_FILENAME
+        if not csv_path.exists():
+            QtWidgets.QMessageBox.warning(
+                self, "No tree cache found",
+                f"No tree cache file found at:\n{csv_path}\n\nUse 'Populate tree' or 'Save Tree' first.",
+            )
+            return
+
+        try:
+            df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Failed to load tree cache", str(exc))
+            return
+
+        self._initialize_empty_data_containers()
+        self.treeWidget_fileStructure.clear()
+        self.treeWidget_fileStructure.setUpdatesEnabled(False)
+
+        for scan_name, scan_rows in df.groupby('scan_name', sort=True):
+            scan_path = self.base_path / scan_name
+            self._seen_scans.add(scan_name)
+            self._seen_param_folders.setdefault(scan_name, set())
+            self._seen_recon_files.setdefault(scan_name, {})
+
+            first = scan_rows.iloc[0]
+            scan_goodness = first['scan_goodness'] or 'unknown'
+            sample_name = first['sample_name']
+
+            row_item = QtWidgets.QTreeWidgetItem(self.treeWidget_fileStructure)
+            self._scan_row_items[scan_name] = row_item
+            self.add_to_tree(row_item, 0, scan_path)
+            row_item.setData(0, Qt.UserRole + 1, scan_goodness)
+            self.apply_scan_goodness_style(row_item, scan_goodness)
+
+            current_param_path = None
+            current_recon_path = None
+
+            for _, r in scan_rows.iterrows():
+                if not r['param_folder']:
+                    continue
+                param_path = scan_path / r['param_folder']
+                self._seen_param_folders[scan_name].add(param_path)
+                self._seen_recon_files[scan_name].setdefault(r['param_folder'], set())
+
+                if r['is_current_param'] == '1':
+                    current_param_path = param_path
+
+                if r['recon_file']:
+                    recon_path = param_path / r['recon_file']
+                    self._seen_recon_files[scan_name][r['param_folder']].add(recon_path)
+                    if r['is_current_recon'] == '1':
+                        current_recon_path = recon_path
+
+            if current_param_path is not None:
+                self.add_to_tree(row_item, 1, current_param_path)
+            else:
+                row_item.setText(1, "—")
+                row_item.setData(1, Qt.ToolTipRole, "No parameter folder found")
+
+            if current_recon_path is not None:
+                self.add_to_tree(row_item, 2, current_recon_path)
+            else:
+                row_item.setText(2, "—")
+                row_item.setData(2, Qt.ToolTipRole, "No recon file found")
+
+            if sample_name:
+                row_item.setText(3, sample_name)
+                row_item.setData(3, Qt.ToolTipRole, sample_name)
+            else:
+                row_item.setText(3, "—")
+                row_item.setData(3, Qt.ToolTipRole, "Sample name not found")
+
+        self.treeWidget_fileStructure.setUpdatesEnabled(True)
+        self.treeWidget_fileStructure.resizeColumnToContents(0)
+        self.treeWidget_fileStructure.resizeColumnToContents(2)
+        self.treeWidget_fileStructure.sortItems(0, Qt.AscendingOrder)
+        self._set_scan_watcher_ui('stopped')
+        print(f"Loaded tree cache from {csv_path}")
 
 
     def _add_param_folder(self, scan_name: str, param_path: Path):
