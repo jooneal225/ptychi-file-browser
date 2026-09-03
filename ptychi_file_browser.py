@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import shutil
 from pathlib import Path
 import numpy as np
@@ -25,6 +26,12 @@ SCAN_BAD_FLAG_COL = "is bad"
 RUNTABLE_BAD_HEADER = "bad"
 LOG_CSV_VIEW_COLS = ["scan", "completed", "sample_name", "date", "time", "ExpTime", "n_pos",
                      "phi", "scan_type"]
+# Widths the user drags in the runtable viewer, kept in QSettings as a
+# {header text: width} json map so they survive a restart. sample_name is left
+# out on purpose: its contents change completely from one run to the next, so it
+# is refitted to the text on every rebuild.
+RUNTABLE_WIDTHS_SETTING = "runtable_column_widths"
+RUNTABLE_AUTOSIZE_COLS = (LOG_CSV_SAMPLE_COL,)
 
 # ---- runtable plot pane ----
 # Where the runtable's plots look for their data. Every subdir is relative to
@@ -1358,8 +1365,59 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
             table.setSortingEnabled(True)
             table.resizeColumnsToContents()
+            self._apply_runtable_column_widths()
         finally:
             self._runtable_updating = False
+
+
+    @staticmethod
+    def _load_runtable_column_widths():
+        """Widths saved by earlier sessions, as {header text: width}."""
+        settings = QSettings("temp", "PtychiFileBrowser")
+        try:
+            widths = json.loads(settings.value(RUNTABLE_WIDTHS_SETTING) or "{}")
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(widths, dict):
+            return {}
+        return {name: int(w) for name, w in widths.items()
+                if isinstance(w, (int, float)) and w > 0}
+
+
+    def _apply_runtable_column_widths(self):
+        """
+        Restore remembered widths over the resize-to-contents defaults. Columns
+        never dragged by hand, and the autosized ones, keep their fitted width.
+        Only called while _runtable_updating, so it does not save itself back.
+        """
+        table = self.tableWidget_runtable
+        widths = self._load_runtable_column_widths()
+        if not widths:
+            return
+
+        for col in range(table.columnCount()):
+            header = table.horizontalHeaderItem(col)
+            if header is None or header.text() in RUNTABLE_AUTOSIZE_COLS:
+                continue
+            width = widths.get(header.text())
+            if width:
+                table.setColumnWidth(col, width)
+
+
+    def _on_runtable_column_resized(self, index, _old_width, new_width):
+        """Remember a width the user just dragged. Rebuilds are ignored."""
+        if self._runtable_updating:
+            return
+
+        header = self.tableWidget_runtable.horizontalHeaderItem(index)
+        if header is None or header.text() in RUNTABLE_AUTOSIZE_COLS:
+            return
+
+        widths = self._load_runtable_column_widths()
+        widths[header.text()] = int(new_width)
+        QSettings("temp", "PtychiFileBrowser").setValue(
+            RUNTABLE_WIDTHS_SETTING, json.dumps(widths)
+        )
 
 
     def _color_runtable_row(self, row, color):
@@ -1469,6 +1527,9 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             self.tableWidget_runtable.itemChanged.connect(self._on_runtable_item_changed)
             self.tableWidget_runtable.itemSelectionChanged.connect(
                 self._on_runtable_row_selected
+            )
+            self.tableWidget_runtable.horizontalHeader().sectionResized.connect(
+                self._on_runtable_column_resized
             )
 
             # The plot pane is added as the splitter's second widget the first
