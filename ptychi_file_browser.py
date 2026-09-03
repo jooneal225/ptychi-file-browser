@@ -35,16 +35,26 @@ LOG_CSV_VIEW_COLS = ["scan", "completed", "sample_name", "date", "time", "ExpTim
 # Each source is tried in order and the first one that yields data wins, so a
 # missing directory, a missing dataset or an unreadable file is never an error,
 # just a reason to try the next entry. 'match' is a substring of the file name
-# (".h5" is matched as a suffix instead) and 'pick' is 'newest' by modification
-# time or 'first' alphabetically.
+# (".h5" is matched as a suffix instead, skipping the detector's master file)
+# and 'pick' is 'newest' by modification time or 'first' alphabetically.
+#
+# 'file_per_dp' marks the raw detector folders, where a scan can be written
+# either as one stacked file or as one file per pattern. When such a folder
+# holds several files the count of files is the pattern count, and only the
+# first is read -- see _runtable_load_image.
 RUNTABLE_IMAGE_DATASETS = ("/entry/data/data", "/entry/data/data00001")
+RUNTABLE_H5_SKIP_SUFFIX = "master.h5"
 RUNTABLE_IMAGE_SOURCES = (
     {"subdir": "preproc/{scan}", "match": "_dp.", "pick": "newest", "datasets": ("/dp",)},
     {"subdir": "results/{scan}", "match": "_dp.", "pick": "newest", "datasets": ("/dp",)},
-    {"subdir": "ptycho/{scan}",  "match": ".h5", "pick": "first", "datasets": RUNTABLE_IMAGE_DATASETS},
-    {"subdir": "ptycho/{scan3}", "match": ".h5", "pick": "first", "datasets": RUNTABLE_IMAGE_DATASETS},
-    {"subdir": "SAXS/{scan}",    "match": ".h5", "pick": "first", "datasets": RUNTABLE_IMAGE_DATASETS},
-    {"subdir": "SAXS/{scan3}",   "match": ".h5", "pick": "first", "datasets": RUNTABLE_IMAGE_DATASETS},
+    {"subdir": "ptycho/{scan}",  "match": ".h5", "pick": "first", "file_per_dp": True,
+     "datasets": RUNTABLE_IMAGE_DATASETS},
+    {"subdir": "ptycho/{scan3}", "match": ".h5", "pick": "first", "file_per_dp": True,
+     "datasets": RUNTABLE_IMAGE_DATASETS},
+    {"subdir": "SAXS/{scan}",    "match": ".h5", "pick": "first", "file_per_dp": True,
+     "datasets": RUNTABLE_IMAGE_DATASETS},
+    {"subdir": "SAXS/{scan3}",   "match": ".h5", "pick": "first", "file_per_dp": True,
+     "datasets": RUNTABLE_IMAGE_DATASETS},
 )
 
 RUNTABLE_SCATTER_SOURCES = (
@@ -53,6 +63,9 @@ RUNTABLE_SCATTER_SOURCES = (
 )
 
 RUNTABLE_NO_FILE_TEXT = "no file found"
+RUNTABLE_FONT_POINT_SIZE = 10
+RUNTABLE_SLICE_TOTAL_EMPTY = "/-"
+RUNTABLE_TOTALS_TEXT = "Total diffraction patterns: %s, Total positions: %s"
 
 # scan_step_size motor -> (displayed unit, multiplier from the unit in the csv).
 # Everything not listed here is a real motor, stored in mm and shown in microns.
@@ -126,12 +139,15 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         # ---- runtable plot pane (built lazily by the 'Show Plots' button) ----
         self._runtable_plot_panel = None   # the whole lower half, None until built
+        self._runtable_plot_controls = None  # slice + log/transpose, in the button row
         self._runtable_image_plot = None   # ImagePlotWidget, left
         self._runtable_scatter = None      # pg.ScatterPlotItem, right
         self._runtable_plot_scan = None    # scan string currently plotted
         self._runtable_img_source = None   # (scan, Path, dataset name) cache
         self._runtable_image_error = None  # unreadable-file message, or None
         self._runtable_scatter_error = None
+        self._runtable_total_dp = None     # patterns in the scan, None if unknown
+        self._runtable_total_pos = None    # scan positions, None if unknown
 
         self.treeWidget_fileStructure.installEventFilter(self)
 
@@ -331,6 +347,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         ----- Red means ignore this run. Yellow means needs reconstruction. Green means all good
         ----- "Bad" checkbox saved between sessions, allows manual control
         ----- "Show Plots" splits the window and plots a diffraction pattern and the scan positions
+        ------- Skips "master.h5"; several .h5 in ptycho/ or SAXS/ means one pattern per file,
+        ------- so the file count is the total and only the first file is read
         ------- A red bar appears if a file and its dataset are both there but will not
         ------- read, which usually means compressed data needing an HDF5 filter plugin
 
@@ -1418,6 +1436,12 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             dlg = RuntableWindow(self, self.save_scan_bad_list)
             dlg.setWindowTitle("Runtable")
 
+            # Qt's 8pt default is small for a dense table; everything in the
+            # window inherits this unless it sets a font of its own
+            font = dlg.font()
+            font.setPointSize(RUNTABLE_FONT_POINT_SIZE)
+            dlg.setFont(font)
+
             layout = QtWidgets.QVBoxLayout(dlg)
 
             self.label_runtablePath = QtWidgets.QLabel()
@@ -1450,9 +1474,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                 "Show a diffraction pattern and the scan positions for the selected scan"
             )
             plots_btn.toggled.connect(self._on_runtable_show_plots_toggled)
+
             btn_row.addWidget(close_btn)
             btn_row.addWidget(refresh_btn)
             btn_row.addWidget(plots_btn)
+            btn_row.addWidget(self._build_runtable_plot_controls())
             btn_row.addStretch()
             layout.addLayout(btn_row)
 
@@ -1483,24 +1509,28 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         label.setToolTip(text)
 
 
-    def _build_runtable_plot_panel(self):
+    def _build_runtable_plot_controls(self):
         """
-        Build the lower half of the runtable: a diffraction pattern on the
-        left and the scan positions on the right, with a slice picker and the
-        image display toggles above them. Called once, on the first time the
-        'Show Plots' button is checked.
+        The plot pane's controls, which live down in the dialog's button row
+        so the pane itself is all plot. Built with the dialog, since the image
+        widget binds the two checkboxes when the pane is built later, but only
+        shown while the pane is.
         """
-        panel = QtWidgets.QWidget()
-        panel_layout = QtWidgets.QVBoxLayout(panel)
-        panel_layout.setContentsMargins(0, 0, 0, 0)
+        self._runtable_plot_controls = QtWidgets.QWidget()
+        controls = QtWidgets.QHBoxLayout(self._runtable_plot_controls)
+        controls.setContentsMargins(0, 0, 0, 0)
 
-        controls = QtWidgets.QHBoxLayout()
         controls.addWidget(QtWidgets.QLabel("slice"))
         self.spinBox_runtableSlice = QtWidgets.QSpinBox()
         self.spinBox_runtableSlice.setRange(0, 0)
         self.spinBox_runtableSlice.setKeyboardTracking(False)
         self.spinBox_runtableSlice.valueChanged.connect(self._on_runtable_slice_changed)
         controls.addWidget(self.spinBox_runtableSlice)
+
+        # How many slices the loaded file offers, i.e. the spinbox's own range
+        self.label_runtableSliceTotal = QtWidgets.QLabel(RUNTABLE_SLICE_TOTAL_EMPTY)
+        controls.addWidget(self.label_runtableSliceTotal)
+
         # Both on by default: diffraction patterns are unreadable linear, and
         # the detector's axes come in the other way round from pyqtgraph's
         self.checkBox_runtableLog = QtWidgets.QCheckBox("log")
@@ -1509,8 +1539,26 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.checkBox_runtableTranspose.setChecked(True)
         controls.addWidget(self.checkBox_runtableLog)
         controls.addWidget(self.checkBox_runtableTranspose)
-        controls.addStretch()
-        panel_layout.addLayout(controls)
+
+        # What the scan holds in total, which is not always what is paged
+        # through above -- see _runtable_load_image
+        self.label_runtableTotals = QtWidgets.QLabel()
+        controls.addWidget(self.label_runtableTotals)
+        self._refresh_runtable_totals()
+
+        self._runtable_plot_controls.setVisible(False)
+        return self._runtable_plot_controls
+
+
+    def _build_runtable_plot_panel(self):
+        """
+        Build the lower half of the runtable: a diffraction pattern on the
+        left and the scan positions on the right. Called once, on the first
+        time the 'Show Plots' button is checked.
+        """
+        panel = QtWidgets.QWidget()
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
 
         # Only shown when a file that is there, holding a dataset that is
         # there, still would not read -- see _read_runtable_slice
@@ -1552,7 +1600,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         scatter_plot.setLabel("bottom", "ppX (um)")
         scatter_plot.setLabel("left", "ppY (um)")
         self._runtable_scatter = pg.ScatterPlotItem(
-            size=5, pen=pg.mkPen(None), brush=pg.mkBrush(30, 120, 255, 180)
+            size=5, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 180)
         )
         scatter_plot.addItem(self._runtable_scatter)
         right_layout.addWidget(scatter_plot)
@@ -1573,6 +1621,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         if self._runtable_plot_panel is not None:
             self._runtable_plot_panel.setVisible(checked)
+        self._runtable_plot_controls.setVisible(checked)
 
         if checked:
             # Plot whatever row is already selected
@@ -1663,16 +1712,28 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         label.setVisible(True)
 
 
+    def _refresh_runtable_totals(self):
+        """Restate what the selected scan holds; a dash where nothing was found."""
+        self.label_runtableTotals.setText(RUNTABLE_TOTALS_TEXT % (
+            "-" if self._runtable_total_dp is None else self._runtable_total_dp,
+            "-" if self._runtable_total_pos is None else self._runtable_total_pos,
+        ))
+
+
     def _clear_runtable_plots(self):
         """Blank both plots, e.g. when nothing is selected."""
         self._runtable_image_plot.clear_image()
         self._runtable_image_plot.set_title(RUNTABLE_NO_FILE_TEXT)
         self._set_runtable_slice_range(0, 0)
+        self.label_runtableSliceTotal.setText(RUNTABLE_SLICE_TOTAL_EMPTY)
         self._runtable_scatter.setData(x=[], y=[])
         self._elide_label(self.label_runtableScatterPath, RUNTABLE_NO_FILE_TEXT)
         self._runtable_image_error = None
         self._runtable_scatter_error = None
+        self._runtable_total_dp = None
+        self._runtable_total_pos = None
         self._refresh_runtable_error()
+        self._refresh_runtable_totals()
 
 
     def _update_runtable_image(self, scan_str):
@@ -1680,20 +1741,28 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         plot = self._runtable_image_plot
         index = self.spinBox_runtableSlice.value()
 
-        data, path, n_slices, source, error = self._runtable_load_image(scan_str, index)
+        data, path, counts, source, error = self._runtable_load_image(scan_str, index)
+        total_dp, total_dp_read = counts
+
         self._runtable_image_error = error
+        self._runtable_total_dp = None if data is None else total_dp
         self._refresh_runtable_error()
+        self._refresh_runtable_totals()
 
         if data is None:
             self._runtable_img_source = None
             plot.clear_image()
             plot.set_title(RUNTABLE_NO_FILE_TEXT)
             self._set_runtable_slice_range(0, 0)
+            self.label_runtableSliceTotal.setText(RUNTABLE_SLICE_TOTAL_EMPTY)
             return
 
         self._runtable_img_source = source
-        # The loader clamps; keep the spinbox agreeing with what is on screen
-        self._set_runtable_slice_range(n_slices, min(index, max(0, n_slices - 1)))
+        # Only what this file can page through, which the loader already
+        # clamped the read to; keep the spinbox agreeing with what is on screen
+        self._set_runtable_slice_range(total_dp_read,
+                                       min(index, max(0, total_dp_read - 1)))
+        self.label_runtableSliceTotal.setText(f"/{total_dp_read}")
         plot.set_title(str(path))
         plot.set_image(data)
 
@@ -1701,8 +1770,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     def _update_runtable_scatter(self, scan_str):
         """Draw the scan positions for one scan, or blank the plot."""
         x, y, path, error = self._runtable_load_scatter(scan_str)
+
         self._runtable_scatter_error = error
+        self._runtable_total_pos = None if x is None else int(x.size)
         self._refresh_runtable_error()
+        self._refresh_runtable_totals()
 
         if x is None:
             self._runtable_scatter.setData(x=[], y=[])
@@ -1717,13 +1789,15 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
     def _runtable_pick_file(self, scan_str, source):
         """
-        The file one RUNTABLE_*_SOURCES entry points at, or None.
+        Resolve one RUNTABLE_*_SOURCES entry to (file, number of candidates).
 
-        A missing base path, a missing directory or an empty directory are all
-        just a miss, so the caller can move on to the next source.
+        The count is what tells a stacked scan from one written a file per
+        pattern. A missing base path, a missing directory or an empty
+        directory are all just a miss -- (None, 0) -- so the caller can move
+        on to the next source.
         """
         if self.base_path is None:
-            return None
+            return None, 0
 
         subdir = source["subdir"].format(scan=scan_str, scan3=scan_str[2:])
         folder = self.base_path.parent / subdir
@@ -1731,19 +1805,22 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         try:
             if match == ".h5":
+                # The detector's master file indexes the others; it is not
+                # itself a source of patterns
                 hits = [p for p in folder.iterdir()
-                        if p.is_file() and p.name.endswith(".h5")]
+                        if p.is_file() and p.name.endswith(".h5")
+                        and not p.name.endswith(RUNTABLE_H5_SKIP_SUFFIX)]
             else:
                 hits = [p for p in folder.iterdir()
                         if p.is_file() and match in p.name]
 
             if not hits:
-                return None
+                return None, 0
             if source["pick"] == "newest":
-                return max(hits, key=lambda p: p.stat().st_mtime)
-            return sorted(hits)[0]
+                return max(hits, key=lambda p: p.stat().st_mtime), len(hits)
+            return sorted(hits)[0], len(hits)
         except OSError:
-            return None
+            return None, 0
 
 
     @staticmethod
@@ -1791,11 +1868,16 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         """
         Find and read a diffraction pattern for one scan.
 
-        Returns (data, path, n_slices, source, error) where source is the
-        (scan, path, dataset name) triple to cache. When nothing could be read
-        the first four are empty and error carries the first real read failure,
-        if there was one -- a scan with simply no files anywhere is not an
-        error, so error stays None for it.
+        Returns (data, path, counts, source, error). counts is
+        (total_dp, total_dp_read): how many patterns the scan holds, and how
+        many of them this file lets us page through. The two differ only for a
+        raw detector folder written one file per pattern, where the file count
+        is the total but only the first file is read. source is the
+        (scan, path, dataset name, total_dp, total_dp_read) tuple to cache.
+
+        When nothing could be read the first four are empty and error carries
+        the first real read failure, if there was one -- a scan with simply no
+        files anywhere is not an error, so error stays None for it.
         """
         errors = []
 
@@ -1805,24 +1887,33 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         cached = self._runtable_img_source
         if cached is not None and cached[0] == scan_str:
-            result, error = self._read_runtable_slice(cached[1], (cached[2],), index)
+            counts = (cached[3], cached[4])
+            result, error = self._read_runtable_slice(
+                cached[1], (cached[2],), min(max(index, 0), max(0, counts[1] - 1))
+            )
             if result is not None:
-                data, n_slices, _ = result
-                return data, cached[1], n_slices, cached, None
+                return result[0], cached[1], counts, cached, None
             note(error)
 
         for source in RUNTABLE_IMAGE_SOURCES:
-            path = self._runtable_pick_file(scan_str, source)
+            path, n_hits = self._runtable_pick_file(scan_str, source)
             if path is None:
                 continue
-            result, error = self._read_runtable_slice(path, source["datasets"], index)
+
+            # One pattern per file: only ever the first file, index 0
+            per_file = bool(source.get("file_per_dp")) and n_hits > 1
+            result, error = self._read_runtable_slice(
+                path, source["datasets"], 0 if per_file else index
+            )
             if result is None:
                 note(error)
                 continue
-            data, n_slices, name = result
-            return data, path, n_slices, (scan_str, path, name), None
 
-        return None, None, 0, None, (errors[0] if errors else None)
+            data, n_slices, name = result
+            counts = (n_hits, 1) if per_file else (n_slices, n_slices)
+            return data, path, counts, (scan_str, path, name) + counts, None
+
+        return None, None, (0, 0), None, (errors[0] if errors else None)
 
 
     def _runtable_load_scatter(self, scan_str):
@@ -1840,7 +1931,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                 errors.append(error)
 
         for source in RUNTABLE_SCATTER_SOURCES:
-            path = self._runtable_pick_file(scan_str, source)
+            path, _n_hits = self._runtable_pick_file(scan_str, source)
             if path is None:
                 continue
 
