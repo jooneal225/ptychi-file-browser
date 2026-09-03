@@ -79,7 +79,8 @@ log_checkbox       displays log10(|data|); toggling redraws      linear display 
 ================== ============================================ ==========================
 
 Other constructor flags: ``enable_lineout``, ``enable_measure``,
-``enable_filters`` (all default True) and ``title_elide_width`` (default 500 px).
+``enable_filters``, ``enable_compare`` (all default True) and
+``title_elide_width`` (default 500 px).
 
 
 Interactions
@@ -88,9 +89,38 @@ Image
     * Left-click two points -> cross markers, a dashed connecting line, and a
       label with the separation in µm and in pixels. A third click clears them.
     * Right-click menu: ``Plot Lineout``, ``Auto-reset Zoom`` (re-fit the view on
-      every new image), and ``Analyze > Median Filter`` / ``Gaussian Filter``
-      (each prompts for a kernel width). Zooming back out is pyqtgraph's own
-      ``View All``.
+      every new image), ``Open comparison window``, and ``Analyze > Median
+      Filter`` / ``Gaussian Filter`` (each prompts for a kernel width). Zooming
+      back out is pyqtgraph's own ``View All``.
+
+Comparison window (shown by ``Open comparison window``)
+    * A separate, non-blocking window that opens empty. ``Set image 1`` and
+      ``Set image 2`` each snapshot whatever the plot is displaying at that
+      moment, along with its pixel size.
+    * Image 1 is the ground truth: drawn solid at the origin, and its pixel size
+      defines the common grid, so image 2 is resampled (linear interpolation)
+      whenever the two pixel sizes differ. Image 2 is drawn semi-transparent on
+      top and is dragged into alignment with the left mouse button; the offset
+      is reported in pixels and µm, and ``Reset offset`` returns it to the
+      origin. Dragging image 2 takes over left-drag panning where it lies —
+      wheel zoom, right-drag scaling and ``View All`` are unaffected.
+    * Each image has its own histogram, so levels and colormap are independent.
+    * ``Side-by-side comparison`` draws both solid and places them horizontally
+      adjacent instead of overlaid; the two need not have the same shape, and
+      the drag offset is remembered for when it is switched back off.
+      ``Hide image 1`` / ``Hide image 2`` temporarily drop one from the view.
+    * ``Subtract`` leaves image 1 alone and puts ``multiplier × image 2 -
+      image 1`` in the image 2 slot, taken over the union of the two so that
+      image 2 stays draggable and the difference follows it live. Side-by-side
+      is cleared and locked out while it is on, ``Hide image 1`` is checked
+      (the difference already carries it, and unchecking brings it back
+      underneath), and the second histogram is re-levelled, the difference
+      straddling zero rather than sitting on image 2's own range. The
+      ``multiplier`` field next to it scales image 2 before the subtraction; it
+      defaults to 1.0.
+    * A second readout under the plot follows the cursor:
+      ``x=…, y=… um, I=…`` for the topmost visible image beneath it, with x and
+      y measured from image 1's centre.
 
 Lineout panel (shown by ``Plot Lineout``)
     * Plots the image sampled along the two measurement points.
@@ -140,6 +170,14 @@ Extension points
     Blank the view -- drops the cached array and every overlay, for hosts that
     would otherwise be left showing a stale image.
 
+``open_comparison_window()`` / ``comparison_window``
+    The programmatic form of the ``Open comparison window`` menu entry. The
+    window is created on first call and reused after that, so calling it again
+    raises the existing one. Pass ``enable_compare=False`` to leave the menu
+    entry out entirely. ``ImageCompareWindow`` is exported too, for hosts that
+    would rather build and place it themselves -- it takes the source
+    ``ImagePlotWidget`` as its first argument.
+
 ``zoom_to_left_square()``, ``reset_zoom()``, ``set_view_range(**kwargs)``
     Zoom helpers. ``reset_zoom()`` is the programmatic form of "View All"; the
     last is a passthrough to ``ViewBox.setRange``.
@@ -170,6 +208,7 @@ working unchanged in every dependent project.
 
 from ._image_view import ImagePlotWidget
 from ._lineout import LineoutPanel, compute_lineout
+from ._compare import ImageCompareWindow
 
-__all__ = ["ImagePlotWidget", "LineoutPanel", "compute_lineout"]
+__all__ = ["ImagePlotWidget", "LineoutPanel", "compute_lineout", "ImageCompareWindow"]
 __version__ = "0.1.0"

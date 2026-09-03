@@ -43,13 +43,16 @@ class ImagePlotWidget(QtWidgets.QWidget):
                  enable_lineout=True,
                  enable_measure=True,
                  enable_filters=True,
+                 enable_compare=True,
                  title_elide_width=500,
                  parent=None):
         super().__init__(parent)
 
         self._enable_measure = enable_measure
         self._enable_filters = enable_filters
+        self._enable_compare = enable_compare
         self._title_elide_width = title_elide_width
+        self._compare_window = None        # created on first use, kept alive here
 
         self._info_label = None
         self._title_label = None
@@ -169,6 +172,12 @@ class ImagePlotWidget(QtWidgets.QWidget):
         self.action_auto_reset_zoom.setCheckable(True)
         self.action_auto_reset_zoom.setChecked(True)
         self._own_add_action(self.action_auto_reset_zoom)
+
+        self.action_compare = None
+        if self._enable_compare:
+            self.action_compare = QtWidgets.QAction("Open comparison window")
+            self.action_compare.triggered.connect(self.open_comparison_window)
+            self._own_add_action(self.action_compare)
 
         self.action_median_filter = None
         self.action_gaussian_filter = None
@@ -537,6 +546,34 @@ class ImagePlotWidget(QtWidgets.QWidget):
         # Re-render from the cached array — no reload from the host
         self.redraw()
         self.sigRedrawRequested.emit()
+
+    # ------------------------------------------------------------------
+    # comparison window
+    # ------------------------------------------------------------------
+
+    def open_comparison_window(self):
+        """
+        Show this widget's comparison window, creating it on first use.
+
+        The window is non-blocking and starts empty; its own buttons pull
+        snapshots out of this widget. It is kept on ``self`` so that reopening
+        raises the existing window rather than making a second one, and so it
+        is not garbage-collected the moment this method returns.
+        """
+        if self._compare_window is None:
+            # Imported here so the module is only loaded by hosts that use it
+            from ._compare import ImageCompareWindow
+            self._compare_window = ImageCompareWindow(self, parent=self)
+
+        self._compare_window.show()
+        self._compare_window.raise_()
+        self._compare_window.activateWindow()
+        return self._compare_window
+
+    @property
+    def comparison_window(self):
+        """The ``ImageCompareWindow``, or None if it has never been opened."""
+        return self._compare_window
 
     # ------------------------------------------------------------------
     # mouse
