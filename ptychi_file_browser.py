@@ -34,32 +34,48 @@ LOG_CSV_VIEW_COLS = ["scan", "completed", "sample_name", "date", "time", "ExpTim
 #
 # Each source is tried in order and the first one that yields data wins, so a
 # missing directory, a missing dataset or an unreadable file is never an error,
-# just a reason to try the next entry. 'match' is a substring of the file name
-# (".h5" is matched as a suffix instead, skipping the detector's master file)
-# and 'pick' is 'newest' by modification time or 'first' alphabetically.
+# just a reason to try the next entry. Files are matched by 'contains' or by
+# 'ends_with', minus anything matching 'skip_ends_with', and 'pick' is 'newest'
+# by modification time or 'first' alphabetically.
 #
 # 'file_per_dp' marks the raw detector folders, where a scan can be written
 # either as one stacked file or as one file per pattern. When such a folder
 # holds several files the count of files is the pattern count, and only the
 # first is read -- see _runtable_load_image.
 RUNTABLE_IMAGE_DATASETS = ("/entry/data/data", "/entry/data/data00001")
-RUNTABLE_H5_SKIP_SUFFIX = "master.h5"
+RUNTABLE_MASTER_SUFFIX = "master.h5"
 RUNTABLE_IMAGE_SOURCES = (
-    {"subdir": "preproc/{scan}", "match": "_dp.", "pick": "newest", "datasets": ("/dp",)},
-    {"subdir": "results/{scan}", "match": "_dp.", "pick": "newest", "datasets": ("/dp",)},
-    {"subdir": "ptycho/{scan}",  "match": ".h5", "pick": "first", "file_per_dp": True,
-     "datasets": RUNTABLE_IMAGE_DATASETS},
-    {"subdir": "ptycho/{scan3}", "match": ".h5", "pick": "first", "file_per_dp": True,
-     "datasets": RUNTABLE_IMAGE_DATASETS},
-    {"subdir": "SAXS/{scan}",    "match": ".h5", "pick": "first", "file_per_dp": True,
-     "datasets": RUNTABLE_IMAGE_DATASETS},
-    {"subdir": "SAXS/{scan3}",   "match": ".h5", "pick": "first", "file_per_dp": True,
-     "datasets": RUNTABLE_IMAGE_DATASETS},
+    {"subdir": "preproc/{scan}", "contains": "_dp.", "pick": "newest", "datasets": ("/dp",)},
+    {"subdir": "results/{scan}", "contains": "_dp.", "pick": "newest", "datasets": ("/dp",)},
+    {"subdir": "ptycho/{scan}",  "ends_with": ".h5", "skip_ends_with": RUNTABLE_MASTER_SUFFIX,
+     "pick": "first", "file_per_dp": True, "datasets": RUNTABLE_IMAGE_DATASETS},
+    {"subdir": "ptycho/{scan3}", "ends_with": ".h5", "skip_ends_with": RUNTABLE_MASTER_SUFFIX,
+     "pick": "first", "file_per_dp": True, "datasets": RUNTABLE_IMAGE_DATASETS},
+    {"subdir": "SAXS/{scan}",    "ends_with": ".h5", "skip_ends_with": RUNTABLE_MASTER_SUFFIX,
+     "pick": "first", "file_per_dp": True, "datasets": RUNTABLE_IMAGE_DATASETS},
+    {"subdir": "SAXS/{scan3}",   "ends_with": ".h5", "skip_ends_with": RUNTABLE_MASTER_SUFFIX,
+     "pick": "first", "file_per_dp": True, "datasets": RUNTABLE_IMAGE_DATASETS},
 )
 
+# Positions come in two layouts: a '_para.' file's pair of 1d datasets in
+# metres, or a detector master file's single (N, 2) dataset in mm holding the
+# positions the scan was *told* to visit. The latter are marked 'nominal' and
+# plotted in a different color, since they are not what was measured. 'scale'
+# converts that file's units to microns.
+RUNTABLE_NOMINAL_POSITIONS = "/entry/sample/positions"
 RUNTABLE_SCATTER_SOURCES = (
-    {"subdir": "preproc/{scan}", "match": "_para.", "pick": "newest", "x": "/ppX", "y": "/ppY"},
-    {"subdir": "results/{scan}", "match": "_para.", "pick": "newest", "x": "/ppX", "y": "/ppY"},
+    {"subdir": "preproc/{scan}", "contains": "_para.", "pick": "newest",
+     "x": "/ppX", "y": "/ppY", "scale": 1e6},
+    {"subdir": "results/{scan}", "contains": "_para.", "pick": "newest",
+     "x": "/ppX", "y": "/ppY", "scale": 1e6},
+    {"subdir": "ptycho/{scan}",  "ends_with": RUNTABLE_MASTER_SUFFIX, "pick": "first",
+     "xy": RUNTABLE_NOMINAL_POSITIONS, "scale": 1e3, "nominal": True},
+    {"subdir": "ptycho/{scan3}", "ends_with": RUNTABLE_MASTER_SUFFIX, "pick": "first",
+     "xy": RUNTABLE_NOMINAL_POSITIONS, "scale": 1e3, "nominal": True},
+    {"subdir": "SAXS/{scan}",    "ends_with": RUNTABLE_MASTER_SUFFIX, "pick": "first",
+     "xy": RUNTABLE_NOMINAL_POSITIONS, "scale": 1e3, "nominal": True},
+    {"subdir": "SAXS/{scan3}",   "ends_with": RUNTABLE_MASTER_SUFFIX, "pick": "first",
+     "xy": RUNTABLE_NOMINAL_POSITIONS, "scale": 1e3, "nominal": True},
 )
 
 RUNTABLE_NO_FILE_TEXT = "no file found"
@@ -347,10 +363,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         ----- Red means ignore this run. Yellow means needs reconstruction. Green means all good
         ----- "Bad" checkbox saved between sessions, allows manual control
         ----- "Show Plots" splits the window and plots a diffraction pattern and the scan positions
-        ------- Skips "master.h5"; several .h5 in ptycho/ or SAXS/ means one pattern per file,
-        ------- so the file count is the total and only the first file is read
-        ------- A red bar appears if a file and its dataset are both there but will not
-        ------- read, which usually means compressed data needing an HDF5 filter plugin
+        ------- Also tries to calculate number of diffraction patterns/positions
+        ------- Blue positions are nominal, taken from a master.h5 when no "_para." file is found
 
         Scan Auto Updater
         --- Every 10.0 s, checks a file "recon_completed.csv"
@@ -1599,8 +1613,10 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         scatter_plot.setAspectLocked(True)
         scatter_plot.setLabel("bottom", "ppX (um)")
         scatter_plot.setLabel("left", "ppY (um)")
+        self._scatter_brush_measured = pg.mkBrush(255, 0, 0, 180)
+        self._scatter_brush_nominal = pg.mkBrush(0, 90, 255, 180)
         self._runtable_scatter = pg.ScatterPlotItem(
-            size=5, pen=pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 180)
+            size=5, pen=pg.mkPen(None), brush=self._scatter_brush_measured
         )
         scatter_plot.addItem(self._runtable_scatter)
         right_layout.addWidget(scatter_plot)
@@ -1769,7 +1785,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
     def _update_runtable_scatter(self, scan_str):
         """Draw the scan positions for one scan, or blank the plot."""
-        x, y, path, error = self._runtable_load_scatter(scan_str)
+        x, y, path, nominal, error = self._runtable_load_scatter(scan_str)
 
         self._runtable_scatter_error = error
         self._runtable_total_pos = None if x is None else int(x.size)
@@ -1781,8 +1797,14 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             self._elide_label(self.label_runtableScatterPath, RUNTABLE_NO_FILE_TEXT)
             return
 
-        self._runtable_scatter.setData(x=x, y=y)
-        self._elide_label(self.label_runtableScatterPath, str(path))
+        # Blue rather than red, and said out loud in the label: these are the
+        # positions the scan was asked for, not the ones it reported
+        self._runtable_scatter.setData(
+            x=x, y=y,
+            brush=self._scatter_brush_nominal if nominal else self._scatter_brush_measured,
+        )
+        self._elide_label(self.label_runtableScatterPath,
+                          f"nominal positions - {path}" if nominal else str(path))
 
 
     # ---- file resolution for the plot pane ----
@@ -1801,18 +1823,21 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         subdir = source["subdir"].format(scan=scan_str, scan3=scan_str[2:])
         folder = self.base_path.parent / subdir
-        match = source["match"]
+        contains = source.get("contains")
+        ends_with = source.get("ends_with")
+        skip = source.get("skip_ends_with")
+
+        def wanted(p):
+            if skip is not None and p.name.endswith(skip):
+                return False
+            if ends_with is not None and not p.name.endswith(ends_with):
+                return False
+            if contains is not None and contains not in p.name:
+                return False
+            return p.is_file()
 
         try:
-            if match == ".h5":
-                # The detector's master file indexes the others; it is not
-                # itself a source of patterns
-                hits = [p for p in folder.iterdir()
-                        if p.is_file() and p.name.endswith(".h5")
-                        and not p.name.endswith(RUNTABLE_H5_SKIP_SUFFIX)]
-            else:
-                hits = [p for p in folder.iterdir()
-                        if p.is_file() and match in p.name]
+            hits = [p for p in folder.iterdir() if wanted(p)]
 
             if not hits:
                 return None, 0
@@ -1916,13 +1941,63 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         return None, None, (0, 0), None, (errors[0] if errors else None)
 
 
+    @staticmethod
+    def _read_runtable_positions(path, source):
+        """
+        Read one file's scan positions, in microns about their own centre.
+
+        Handles both layouts a source can name: a pair of 1d datasets ('x' and
+        'y'), or a single (N, 2) one ('xy') whose columns are x and y. The
+        stage offset is subtracted either way -- what matters is the shape of
+        the scan, not where on the stage it happened to sit.
+
+        Returns ((x, y), error) on the same terms as _read_runtable_slice: the
+        error is set only when the datasets were there but would not read.
+        """
+        names = (source["xy"],) if "xy" in source else (source["x"], source["y"])
+
+        try:
+            f = h5py.File(path, "r")
+        except OSError as exc:
+            return None, f"cannot open {path.name}: {exc}"
+
+        try:
+            with f:
+                if any(name not in f for name in names):
+                    return None, None
+                try:
+                    if "xy" in source:
+                        arr = np.asarray(f[names[0]][()], dtype=float)
+                        if arr.ndim != 2 or arr.shape[1] < 2:
+                            return None, None
+                        x, y = arr[:, 0], arr[:, 1]
+                    else:
+                        x = np.asarray(f[names[0]][()], dtype=float).ravel()
+                        y = np.asarray(f[names[1]][()], dtype=float).ravel()
+                except (OSError, ValueError, TypeError) as exc:
+                    return None, (f"could not read {' and '.join(names)} in "
+                                  f"{path.name} - HDF5 plugin may be required ({exc})")
+        except (OSError, KeyError, ValueError, TypeError) as exc:
+            return None, f"could not read {path.name}: {exc}"
+
+        n = min(x.size, y.size)
+        if n == 0:
+            return None, None
+
+        x, y = x[:n], y[:n]
+        scale = source["scale"]
+        return ((x - x.mean()) * scale, (y - y.mean()) * scale), None
+
+
     def _runtable_load_scatter(self, scan_str):
         """
         Find and read the scan positions for one scan.
 
-        Returns (x, y, path, error). When nothing could be read the first three
-        are None and error carries the first real read failure, as in
-        _runtable_load_image.
+        Returns (x, y, path, nominal, error). nominal is True when the
+        positions came from a detector master file, i.e. where the scan was
+        told to go rather than where it recorded going. When nothing could be
+        read the first three are None and error carries the first real read
+        failure, as in _runtable_load_image.
         """
         errors = []
 
@@ -1935,37 +2010,15 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             if path is None:
                 continue
 
-            try:
-                f = h5py.File(path, "r")
-            except OSError as exc:
-                note(f"cannot open {path.name}: {exc}")
+            result, error = self._read_runtable_positions(path, source)
+            if result is None:
+                note(error)
                 continue
 
-            try:
-                with f:
-                    if source["x"] not in f or source["y"] not in f:
-                        continue
-                    try:
-                        x = np.asarray(f[source["x"]][()], dtype=float).ravel()
-                        y = np.asarray(f[source["y"]][()], dtype=float).ravel()
-                    except (OSError, ValueError, TypeError) as exc:
-                        note(f"could not read {source['x']} and {source['y']} in "
-                             f"{path.name} - HDF5 plugin may be required ({exc})")
-                        continue
-            except (OSError, KeyError, ValueError, TypeError) as exc:
-                note(f"could not read {path.name}: {exc}")
-                continue
+            x, y = result
+            return x, y, path, bool(source.get("nominal")), None
 
-            n = min(x.size, y.size)
-            if n == 0:
-                continue
-
-            # Stored in metres and offset by wherever the stage happened to be;
-            # what matters is the shape of the scan, in microns about its centre
-            x, y = x[:n], y[:n]
-            return (x - x.mean()) * 1e6, (y - y.mean()) * 1e6, path, None
-
-        return None, None, None, (errors[0] if errors else None)
+        return None, None, None, False, (errors[0] if errors else None)
 
 
     # ------------------------------------------------------------------

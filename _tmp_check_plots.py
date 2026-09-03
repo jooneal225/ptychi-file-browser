@@ -22,6 +22,12 @@ def npts(scatter_item):
     x, _ = scatter_item.getData()
     return 0 if x is None else len(x)
 
+def brush_rgba(scatter_item):
+    """Color of the plotted points, however this pyqtgraph stores it."""
+    data = scatter_item.data
+    b = data['brush'][0] if len(data) else scatter_item.opts.get('brush')
+    return None if b is None else b.color().getRgb()
+
 def logview(a):
     """What ImagePlotWidget._render produces with the log checkbox on."""
     mag = np.abs(a.astype(np.float32))
@@ -59,9 +65,12 @@ with h5py.File(run / "ptycho" / "042" / "aaa.h5", "w") as f:   # first alphabeti
     f.create_dataset("/entry/data/data00001", data=IMG2D * 2)
 with h5py.File(run / "ptycho" / "042" / "ccc.h5", "w") as f:
     f.create_dataset("/entry/data/data00001", data=IMG2D * 3)
-# sorts ahead of the data files, so it wins 'first' unless it is skipped
+# sorts ahead of the data files, so it wins 'first' unless it is skipped.
+# It also carries the nominal positions, in mm, for the right-hand plot.
+NOMINAL_MM = np.stack([np.linspace(0.1, 0.3, 40), np.linspace(-0.2, 0.2, 40)], axis=1)
 with h5py.File(run / "ptycho" / "042" / "0000_master.h5", "w") as f:
     f.create_dataset("/entry/data/data00001", data=np.zeros((4, 4), np.float32))
+    f.create_dataset("/entry/sample/positions", data=NOMINAL_MM)
 
 # S0044 -> SAXS/S0044, a single stacked file: totals come from the stack
 (run / "SAXS" / "S0044").mkdir(parents=True)
@@ -174,9 +183,12 @@ check("S0041 scatter is mean-subtracted and in microns",
       and np.allclose(sx, (PPX - PPX.mean()) * 1e6)
       and np.allclose(sy, (PPY - PPY.mean()) * 1e6),
       len(sx))
-check("scatter path label names the _para. file",
-      "foo_para.h5" in w.label_runtableScatterPath.toolTip(),
+check("scatter path label names the _para. file, with no nominal warning",
+      "foo_para.h5" in w.label_runtableScatterPath.toolTip()
+      and "nominal" not in w.label_runtableScatterPath.toolTip(),
       w.label_runtableScatterPath.toolTip())
+check("measured positions are plotted red",
+      brush_rgba(scat) == (255, 0, 0, 180), brush_rgba(scat))
 
 # ------------------------------------------------------ 3. the slice picker
 spin.setValue(3)
@@ -200,11 +212,21 @@ check("several files means one pattern per file: only the first is readable",
       and w.label_runtableSliceTotal.text() == "/1",
       (spin.maximum(), spin.value(), w.label_runtableSliceTotal.text()))
 check("the file count is the pattern total, master excluded",
-      w.label_runtableTotals.text() == TOTALS((3, "-")), w.label_runtableTotals.text())
-check("S0042 has no scatter file",
-      npts(scat) == 0
-      and w.label_runtableScatterPath.text() == M.RUNTABLE_NO_FILE_TEXT,
-      w.label_runtableScatterPath.text())
+      w.label_runtableTotals.text() == TOTALS((3, 40)), w.label_runtableTotals.text())
+
+# S0042 has no _para. file, so positions fall back to the master's nominal ones
+sx, sy = scat.getData()
+check("nominal positions come from the master file's (N, 2) dataset",
+      len(sx) == 40
+      and np.allclose(sx, (NOMINAL_MM[:, 0] - NOMINAL_MM[:, 0].mean()) * 1e3)
+      and np.allclose(sy, (NOMINAL_MM[:, 1] - NOMINAL_MM[:, 1].mean()) * 1e3),
+      len(sx))
+check("nominal positions are labelled as such",
+      w.label_runtableScatterPath.toolTip().startswith("nominal positions - ")
+      and w.label_runtableScatterPath.toolTip().endswith("0000_master.h5"),
+      w.label_runtableScatterPath.toolTip())
+check("nominal positions are plotted blue",
+      brush_rgba(scat) == (0, 90, 255, 180), brush_rgba(scat))
 
 # ------------------- 4b. SAXS, a single stacked file: the stack is the total
 t.selectRow(rows["S0044"])
@@ -216,8 +238,10 @@ check("a lone stacked file pages through its whole depth",
       and w.label_runtableSliceTotal.text() == "/7"
       and np.array_equal(img.raw_data, STACK[0]),
       (spin.maximum(), w.label_runtableSliceTotal.text()))
-check("its depth is also the pattern total",
-      w.label_runtableTotals.text() == TOTALS((7, "-")), w.label_runtableTotals.text())
+check("its depth is also the pattern total, and a master with no positions "
+      "dataset is a clean miss",
+      w.label_runtableTotals.text() == TOTALS((7, "-"))
+      and w.label_runtableError.isHidden(), w.label_runtableTotals.text())
 spin.setValue(5)
 check("slices of a lone stacked file are reachable",
       np.array_equal(img.raw_data, STACK[5]))
