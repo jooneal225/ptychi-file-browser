@@ -24,6 +24,7 @@ SCAN_BAD_LIST_FILENAME = "scan_bad_list.csv"
 SCAN_BAD_SCAN_COL = "scan"
 SCAN_BAD_FLAG_COL = "is bad"
 RUNTABLE_BAD_HEADER = "bad"
+RUNTABLE_ZTRANS_COL = "BSZP_Ztrans"
 LOG_CSV_VIEW_COLS = ["scan", "completed", "sample_name", "date", "time", "ExpTime", "n_pos",
                      "phi", "scan_type"]
 # Widths the user drags in the runtable viewer, kept in QSettings as a
@@ -1279,9 +1280,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     def _runtable_row_color(self, scan_key, completed_value, marked_bad=False):
         """
         Row color for the runtable, applied in increasing precedence:
-        scan goodness, then whether a recon file exists, then not completed,
-        and finally the manual 'bad' checkbox / scan_bad_list.csv. Note that
-        an 'is bad' of no never clears a color the other rules produced.
+        scan goodness, then whether a recon file exists, then partially
+        completed, and finally the manual 'bad' checkbox / scan_bad_list.csv.
+        Note that an 'is bad' of no never clears a color the other rules
+        produced. A completed value of "no" is left alone here rather than
+        marked bad, since it also covers scans still being measured.
         """
         row_item = self._scan_row_items.get(scan_key)
 
@@ -1297,7 +1300,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             # Analyzed, but no scan goodness set yet
             color = RECON_EXISTS_COLOR
 
-        if completed_value is not None and str(completed_value).strip().lower() == "no":
+        if completed_value is not None and str(completed_value).strip().lower() == "partial":
             color = GOODNESS_COLORS['bad']
 
         if marked_bad:
@@ -1326,14 +1329,16 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
             headers, step_motors = self._runtable_columns(df)
             plain_cols = len(headers) - len(step_motors)
-            bad_col = len(headers)
+            ztrans_col = len(headers)
+            bad_col = ztrans_col + 1
 
-            table.setColumnCount(len(headers) + 1)
-            table.setHorizontalHeaderLabels(headers + [RUNTABLE_BAD_HEADER])
+            table.setColumnCount(len(headers) + 2)
+            table.setHorizontalHeaderLabels(headers + [RUNTABLE_ZTRANS_COL, RUNTABLE_BAD_HEADER])
             table.setRowCount(len(df))
 
             completed = df["completed"] if "completed" in df.columns else None
             scans = df[LOG_CSV_SCAN_COL]
+            ztrans = df[RUNTABLE_ZTRANS_COL] if RUNTABLE_ZTRANS_COL in df.columns else None
 
             for row in range(len(df)):
                 for col in range(plain_cols):
@@ -1345,6 +1350,9 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                     for offset, motor in enumerate(step_motors):
                         table.setItem(row, plain_cols + offset,
                                       self._make_runtable_item(steps.get(motor)))
+
+                table.setItem(row, ztrans_col, self._make_runtable_item(
+                    None if ztrans is None else ztrans.iloc[row]))
 
                 scan_key = str(scans.iloc[row]).strip()
                 completed_value = None if completed is None else completed.iloc[row]
