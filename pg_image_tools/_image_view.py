@@ -14,6 +14,17 @@ from scipy.ndimage import median_filter, gaussian_filter
 
 from ._lineout import LineoutPanel
 
+# The unwrap-phase ROI's initial extent, as a fraction of the displayed image
+ROI_INITIAL_FRAC = 0.5
+
+UNWRAP_CHOICES = ["Entire image", "Rectangular region", "Circular region"]
+UNWRAP_KIND_BY_CHOICE = {
+    "Entire image": 'full',
+    "Rectangular region": 'rect',
+    "Circular region": 'circle',
+}
+UNWRAP_CHOICE_BY_KIND = {v: k for k, v in UNWRAP_KIND_BY_CHOICE.items()}
+
 
 class ImagePlotWidget(QtWidgets.QWidget):
     """
@@ -69,6 +80,15 @@ class ImagePlotWidget(QtWidgets.QWidget):
         self._active_filter = None         # 'median' | 'gaussian' | None
         self._filter_kernel = 3.0
 
+        # ---- unwrap-phase state ----
+        self._unwrap_enabled = False       # mirrors action_unwrap_phase.isChecked()
+        self._unwrap_kind = None           # 'full' | 'rect' | 'circle' | None -- remembered
+                                            # across toggles so the dialog can default to it
+        self._unwrap_roi = None            # pg.RectROI | pg.CircleROI | None ('rect'/'circle' only)
+        self._unwrap_mask = None           # bool mask (displayed coords) from the last Apply
+                                            # click; None means "pending" -- ROI shown, not applied
+        self._unwrap_overlay = None        # floating Apply/Cancel buttons
+
         # ---- widgets ----
         self.pg_view = pg.ImageView()
         self.lineout = LineoutPanel() if enable_lineout else None
@@ -94,6 +114,8 @@ class ImagePlotWidget(QtWidgets.QWidget):
             self.pg_view.scene.sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved
         )
         self.pg_view.scene.sigMouseClicked.connect(self._on_mouse_clicked)
+        # Keeps the floating unwrap-phase Apply/Cancel overlay anchored on resize.
+        self.pg_view.installEventFilter(self)
 
         # ---- optional companions ----
         self.attach_info_label(info_label)
@@ -181,11 +203,14 @@ class ImagePlotWidget(QtWidgets.QWidget):
 
         self.action_median_filter = None
         self.action_gaussian_filter = None
-        if self._enable_filters:
-            self._own_add_separator()
-            self._analyze_menu = QtWidgets.QMenu("Analyze")
-            self._own_add_menu(self._analyze_menu)
 
+        # "Analyze" holds filters (gated by enable_filters) and Unwrap Phase
+        # (always available -- it isn't a display filter, it's independent).
+        self._own_add_separator()
+        self._analyze_menu = QtWidgets.QMenu("Analyze")
+        self._own_add_menu(self._analyze_menu)
+
+        if self._enable_filters:
             self.action_median_filter = QtWidgets.QAction("Median Filter")
             self.action_median_filter.setCheckable(True)
             self.action_median_filter.triggered.connect(
@@ -199,6 +224,11 @@ class ImagePlotWidget(QtWidgets.QWidget):
                 lambda checked: self.set_filter('gaussian', checked)
             )
             self._analyze_menu.addAction(self.action_gaussian_filter)
+
+        self.action_unwrap_phase = QtWidgets.QAction("Unwrap Phase")
+        self.action_unwrap_phase.setCheckable(True)
+        self.action_unwrap_phase.triggered.connect(self._on_unwrap_toggled)
+        self._analyze_menu.addAction(self.action_unwrap_phase)
 
     def _note_anchor(self, action):
         if self._menu_anchor is None:
@@ -331,14 +361,29 @@ class ImagePlotWidget(QtWidgets.QWidget):
         self._raw_data = data
         self._pixel_size_m = float(pixel_size_m)
 
+        # A red ROI that's still on screen from a previous image is applied
+        # again automatically, at its current position/size, against the new
+        # data -- no Apply click needed. (Apply is only for confirming a
+        # freshly-placed ROI, or a drag/resize of an existing one.)
+        if self._unwrap_enabled and self._unwrap_kind in ('rect', 'circle') and self._unwrap_roi is not None:
+            self._displayed_shape = self._compute_displayed_shape(data)
+            self._unwrap_mask = self._roi_mask(self._unwrap_roi, self._unwrap_kind)
+
         # Measurement coords are image-specific
         self.clear_measure_points(update_lineout=False)
         self.clear_scatter_overlay()
 
         if autoRange is None:
             autoRange = self.action_auto_reset_zoom.isChecked()
-        self._render(autoRange=autoRange)
+        self._render(autoRange=autoRange)   # sets self._displayed_shape for the new data
         self._update_lineout()
+
+        if (self._unwrap_enabled and self._unwrap_kind in ('rect', 'circle')
+                and self._unwrap_roi is None):
+            # No ROI survived (e.g. a clear_image() in between) -- place a
+            # fresh one and wait for the user to confirm it with Apply.
+            self._place_unwrap_roi()
+            self._show_unwrap_overlay()
 
     def clear_image(self):
         """
@@ -348,6 +393,10 @@ class ImagePlotWidget(QtWidgets.QWidget):
         the file a selection points at cannot be found. A later ``set_image()``
         brings the view back as usual.
         """
+        self._remove_unwrap_roi()
+        if self._unwrap_overlay is not None:
+            self._unwrap_overlay.hide()
+        self._unwrap_mask = None
         self._raw_data = None
         self._displayed_shape = None
         self._info_base_text = ''
@@ -378,6 +427,8 @@ class ImagePlotWidget(QtWidgets.QWidget):
         if self._transpose_checked():
             data = data.T
         self._displayed_shape = data.shape   # (nx, ny) in pyqtgraph convention
+
+        data = self._unwrap_for_render(data)
 
         pix_size_nm = round(self._pixel_size_m * 1e9)
         self._info_base_text = "%.2f×%.2f µm, %d nm pix" % (
@@ -445,6 +496,10 @@ class ImagePlotWidget(QtWidgets.QWidget):
         )
         self._title_label.setText(elided)
         self._title_label.setToolTip(text)
+
+    def _compute_displayed_shape(self, data):
+        """(nx, ny) ``data`` will have once displayed, without actually rendering it."""
+        return data.shape[::-1] if self._transpose_checked() else data.shape
 
     def _transpose_checked(self):
         return self._transpose_checkbox is not None and self._transpose_checkbox.isChecked()
@@ -546,6 +601,199 @@ class ImagePlotWidget(QtWidgets.QWidget):
         # Re-render from the cached array — no reload from the host
         self.redraw()
         self.sigRedrawRequested.emit()
+
+    # ------------------------------------------------------------------
+    # unwrap phase
+    # ------------------------------------------------------------------
+
+    def _on_unwrap_toggled(self, checked: bool):
+        """"Unwrap Phase" menu entry is now a toggle: checked = keep unwrapping live."""
+        if checked:
+            self._enable_unwrap()
+        else:
+            self._disable_unwrap()
+
+    def _enable_unwrap(self):
+        if self._raw_data is None:
+            self._set_unwrap_checked(False)
+            return
+
+        try:
+            from skimage.restoration import unwrap_phase  # noqa: F401  (availability check)
+        except ImportError:
+            QtWidgets.QMessageBox.warning(
+                self, "Unwrap Phase",
+                "Unwrap Phase needs scikit-image, which is not installed in this environment."
+            )
+            self._set_unwrap_checked(False)
+            return
+
+        default_index = UNWRAP_CHOICES.index(
+            UNWRAP_CHOICE_BY_KIND.get(self._unwrap_kind, UNWRAP_CHOICES[0])
+        )
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self, "Unwrap Phase", "Choose region to unwrap:",
+            UNWRAP_CHOICES, default_index, False,
+        )
+        if not ok:
+            self._set_unwrap_checked(False)
+            return
+
+        self._unwrap_kind = UNWRAP_KIND_BY_CHOICE[choice]
+        self._unwrap_mask = None
+        self._unwrap_enabled = True
+
+        if self._unwrap_kind == 'full':
+            self._remove_unwrap_roi()
+        else:
+            self._place_unwrap_roi()
+            self._show_unwrap_overlay()
+
+        self.redraw()
+        self.sigRedrawRequested.emit()
+
+    def _disable_unwrap(self):
+        self._unwrap_enabled = False
+        self._unwrap_mask = None
+        self._remove_unwrap_roi()
+        if self._unwrap_overlay is not None:
+            self._unwrap_overlay.hide()
+        self._set_unwrap_checked(False)
+
+        self.redraw()
+        self.sigRedrawRequested.emit()
+
+    def _set_unwrap_checked(self, checked: bool):
+        """Sync the menu checkmark without re-entering ``_on_unwrap_toggled``."""
+        action = self.action_unwrap_phase
+        if action is not None and action.isChecked() != checked:
+            action.blockSignals(True)
+            action.setChecked(checked)
+            action.blockSignals(False)
+
+    def _place_unwrap_roi(self):
+        """(Re)create the draggable/resizable red ROI for the current unwrap kind."""
+        self._remove_unwrap_roi()
+
+        nx, ny = self._displayed_shape
+        w = max(nx * ROI_INITIAL_FRAC, 4.0)
+        h = max(ny * ROI_INITIAL_FRAC, 4.0)
+        pos = [(nx - w) / 2, (ny - h) / 2]
+
+        if self._unwrap_kind == 'rect':
+            roi = pg.RectROI(pos, [w, h], pen=pg.mkPen('r', width=2), sideScalers=True)
+        else:
+            side = min(w, h)
+            roi = pg.CircleROI([(nx - side) / 2, (ny - side) / 2], [side, side],
+                                pen=pg.mkPen('r', width=2))
+
+        roi.setZValue(10)
+        self.pg_view.getView().addItem(roi)
+        self._unwrap_roi = roi
+
+    def _remove_unwrap_roi(self):
+        if self._unwrap_roi is not None:
+            self.pg_view.getView().removeItem(self._unwrap_roi)
+            self._unwrap_roi = None
+
+    def _apply_unwrap_roi(self):
+        """Apply-button handler: unwrap only inside the ROI's *current* position/size."""
+        if self._unwrap_roi is None:
+            return
+        self._unwrap_mask = self._roi_mask(self._unwrap_roi, self._unwrap_kind)
+        self.redraw()
+        self.sigRedrawRequested.emit()
+
+    def _ensure_unwrap_overlay(self):
+        if self._unwrap_overlay is not None:
+            return
+        overlay = QtWidgets.QWidget(self.pg_view)
+        overlay.setStyleSheet(
+            "QWidget { background-color: rgba(255, 255, 255, 220); "
+            "border: 1px solid palette(mid); border-radius: 4px; }"
+        )
+        layout = QtWidgets.QHBoxLayout(overlay)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(6)
+
+        btn_apply = QtWidgets.QPushButton("Apply")
+        btn_apply.clicked.connect(self._apply_unwrap_roi)
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        # Call _disable_unwrap() directly rather than action.setChecked(False):
+        # setChecked() alone doesn't emit `triggered`, so it would desync the
+        # checkmark from the actual (still-enabled) unwrap state.
+        btn_cancel.clicked.connect(self._disable_unwrap)
+
+        layout.addWidget(btn_apply)
+        layout.addWidget(btn_cancel)
+        overlay.adjustSize()
+        overlay.hide()
+
+        self._unwrap_overlay = overlay
+
+    def _show_unwrap_overlay(self):
+        self._ensure_unwrap_overlay()
+        self._position_unwrap_overlay()
+        self._unwrap_overlay.show()
+        self._unwrap_overlay.raise_()
+
+    def _position_unwrap_overlay(self):
+        if self._unwrap_overlay is None:
+            return
+        # Top-left of the plot area -- top-right would sit under pyqtgraph's
+        # own histogram/LUT panel, which is docked on the right of pg_view.
+        self._unwrap_overlay.move(8, 8)
+
+    def eventFilter(self, obj, event):
+        if obj is self.pg_view and event.type() == QtCore.QEvent.Resize:
+            if self._unwrap_overlay is not None and self._unwrap_overlay.isVisible():
+                self._position_unwrap_overlay()
+        return super().eventFilter(obj, event)
+
+    def _roi_mask(self, roi, kind: str):
+        """Boolean mask, shape == displayed_shape, True where the ROI covers a pixel."""
+        nx, ny = self._displayed_shape
+        pos, size = roi.pos(), roi.size()
+        x0, y0, w, h = pos.x(), pos.y(), size.x(), size.y()
+
+        xs = np.arange(nx)[:, None]
+        ys = np.arange(ny)[None, :]
+
+        if kind == 'rect':
+            return (xs >= x0) & (xs < x0 + w) & (ys >= y0) & (ys < y0 + h)
+
+        cx, cy = x0 + w / 2, y0 + h / 2
+        r = w / 2
+        return (xs - cx) ** 2 + (ys - cy) ** 2 <= r ** 2
+
+    def _unwrap_for_render(self, data):
+        """
+        Apply the currently-enabled unwrap, if any, to already-oriented display data.
+
+        Non-destructive -- like the filters, this only affects what gets drawn.
+        ``data`` is already transposed to displayed orientation, matching the
+        coordinate space ``_roi_mask`` builds masks in.
+        """
+        if not self._unwrap_enabled:
+            return data
+        try:
+            from skimage.restoration import unwrap_phase
+        except ImportError:
+            return data   # availability was already checked (with a popup) on enable
+
+        wrapped = np.angle(np.exp(1j * data.astype(np.float64)))   # fold to [-pi, pi)
+
+        if self._unwrap_kind == 'full':
+            return unwrap_phase(wrapped).astype(np.float32)
+
+        mask = self._unwrap_mask
+        if mask is None or mask.shape != data.shape:
+            return data   # pending -- ROI shown, waiting for the Apply button
+
+        result = unwrap_phase(np.ma.array(wrapped, mask=~mask))
+        out = data.astype(np.float64)
+        out[mask] = np.ma.getdata(result)[mask]
+        return out.astype(np.float32)
 
     # ------------------------------------------------------------------
     # comparison window

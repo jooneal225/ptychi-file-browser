@@ -20,6 +20,12 @@ SIDE_BY_SIDE_GAP_FRAC = 0.03
 
 IMAGE2_OPACITY = 0.5
 
+# The red box's initial extent, as a fraction of image 1
+ROI_INITIAL_FRAC = 0.5
+
+# Sub-pixel refinement of the phase-correlation peak, in 1/N of a pixel
+PHASE_CORR_UPSAMPLING = 10
+
 
 class _DraggableImageItem(pg.ImageItem):
     """
@@ -86,6 +92,11 @@ class ImageCompareWindow(QtWidgets.QWidget):
     -- and only that slot -- for ``multiplier × image 2 - image 1``, taken over
     the union of the two, so image 2 stays draggable and the difference updates
     as it moves.
+
+    ``Red box`` adds a resizable rectangle that scopes every quantitative
+    feature: the overlap it marks is what gets phase-correlated by ``Align``,
+    what PSNR and MSE are measured over, what ``Intensity correction`` derives
+    its linear map from, and what ``Compute FSC`` transforms.
     """
 
     def __init__(self, source, parent=None):
@@ -99,13 +110,17 @@ class ImageCompareWindow(QtWidgets.QWidget):
         # {'data': 2d ndarray, 'pixel_size_m': float, 'label': str}
         self._slots = [None, None]
         self._grid_data = [None, None]            # slots resampled onto the common grid
+        self._corrected2 = None                   # image 2's grid after intensity correction
         self._displayed = [None, None]            # what each item actually shows
         self._image2_origin = (0.0, 0.0)          # where the image 2 item is drawn
         self._offset = QtCore.QPointF(0.0, 0.0)   # image 2 drag offset, grid pixels
         self._drag_base = None                    # offset at the start of a drag
-        self._hide1_before_subtract = False       # restored when subtract goes off
+        self._vis_before_subtract = None          # restored when subtract goes off
         self._grid_pixel_size_m = 1.0
         self._resample_factor = 1.0
+        self._roi_placed = False                  # the box is centred once, then left alone
+        self._intensity_map = None                # (gain, offset) actually applied, or None
+        self._fsc_window = None                   # kept alive here, like the compare window
 
         self._build_ui()
         self._rebuild()
@@ -134,6 +149,17 @@ class ImageCompareWindow(QtWidgets.QWidget):
         self._img2.sigDragged.connect(self._on_image2_dragged)
         self._plot.addItem(self._img2)
 
+        # Above both images, so its handles stay grabbable at any z-order. It
+        # is translatable, which is deliberate: a left-drag inside the box moves
+        # the box and a left-drag outside it moves image 2.
+        self._roi = pg.RectROI(
+            [0, 0], [100, 100], pen=pg.mkPen('r', width=2), sideScalers=True,
+        )
+        self._roi.setZValue(10)
+        self._roi.setVisible(False)
+        self._roi.sigRegionChanged.connect(self._on_roi_changed)
+        self._plot.addItem(self._roi)
+
         self._hist1 = pg.HistogramLUTItem()
         self._hist1.setImageItem(self._img1)
         self._glw.addItem(self._hist1, row=0, col=1)
@@ -146,17 +172,13 @@ class ImageCompareWindow(QtWidgets.QWidget):
             self._glw.scene().sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved
         )
 
-        # --- readouts ---
+        # --- readouts, each paired with the controls that act on it, to its
+        # right, rather than stacking label rows above button rows ---
+        info_row = QtWidgets.QHBoxLayout()
         self._info_label = QtWidgets.QLabel()
         self._info_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self._info_label)
+        info_row.addWidget(self._info_label, stretch=1)
 
-        self._cursor_label = QtWidgets.QLabel()
-        self._cursor_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self._cursor_label)
-
-        # --- buttons ---
-        btn_row = QtWidgets.QHBoxLayout()
         self._btn_set1 = QtWidgets.QPushButton("Set image 1")
         self._btn_set1.setToolTip("Copy what the source plot is showing into image 1 (ground truth)")
         self._btn_set1.clicked.connect(lambda: self.capture(0))
@@ -165,46 +187,104 @@ class ImageCompareWindow(QtWidgets.QWidget):
         self._btn_set2.clicked.connect(lambda: self.capture(1))
         self._btn_reset = QtWidgets.QPushButton("Reset offset")
         self._btn_reset.clicked.connect(self.reset_offset)
+        info_row.addWidget(self._btn_set1)
+        info_row.addWidget(self._btn_set2)
+        info_row.addWidget(self._btn_reset)
+        layout.addLayout(info_row)
 
-        btn_row.addWidget(self._btn_set1)
-        btn_row.addWidget(self._btn_set2)
-        btn_row.addWidget(self._btn_reset)
-        btn_row.addStretch(1)
-        layout.addLayout(btn_row)
+        # --- cursor readout, alongside display and subtract controls ---
+        cursor_row = QtWidgets.QHBoxLayout()
+        self._cursor_label = QtWidgets.QLabel()
+        self._cursor_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        cursor_row.addWidget(self._cursor_label, stretch=1)
 
-        # --- checkboxes ---
-        chk_row = QtWidgets.QHBoxLayout()
         self._chk_side_by_side = QtWidgets.QCheckBox("Side-by-side comparison")
         self._chk_side_by_side.setToolTip(
             "Draw both images solid, placed horizontally adjacent instead of overlaid"
         )
-        self._chk_hide1 = QtWidgets.QCheckBox("Hide image 1")
-        self._chk_hide2 = QtWidgets.QCheckBox("Hide image 2")
-        for chk in (self._chk_side_by_side, self._chk_hide1, self._chk_hide2):
-            chk.toggled.connect(self._rebuild)
-            chk_row.addWidget(chk)
-
-        # Not in the loop above: it has to lock out side-by-side and re-level
-        # image 2, whose range changes completely when it becomes a difference.
+        # Not wired in the loop below: it has to lock out side-by-side and
+        # re-level image 2, whose range changes completely as a difference.
         self._chk_subtract = QtWidgets.QCheckBox("Subtract")
         self._chk_subtract.setToolTip(
             "Leave image 1 alone and plot (multiplier × image 2) - image 1 in the\n"
             "image 2 slot, over the union of the two. Image 2 stays draggable."
         )
         self._chk_subtract.toggled.connect(self._on_subtract_toggled)
-        chk_row.insertWidget(1, self._chk_subtract)
+        self._chk_show_both = QtWidgets.QCheckBox("Show both images")
+        self._chk_show_both.setChecked(True)
+        self._chk_show_both.setToolTip(
+            "Overlay both, image 2 semi-transparent.\n"
+            "Uncheck to look at one image at a time, fully opaque."
+        )
+        self._chk_show_only1 = QtWidgets.QCheckBox("Show only image 1")
+        self._chk_show_only1.setChecked(True)
+        self._chk_show_only1.setToolTip(
+            "Which image is the one shown while \"Show both images\" is off.\n"
+            "Unchecked shows image 2 instead."
+        )
+        for chk in (self._chk_side_by_side, self._chk_subtract,
+                    self._chk_show_both, self._chk_show_only1):
+            cursor_row.addWidget(chk)
+        for chk in (self._chk_side_by_side, self._chk_show_both, self._chk_show_only1):
+            chk.toggled.connect(self._rebuild)
 
-        chk_row.addSpacing(12)
-        chk_row.addWidget(QtWidgets.QLabel("multiplier"))
+        cursor_row.addSpacing(12)
+        cursor_row.addWidget(QtWidgets.QLabel("multiplier"))
         self._edit_multiplier = QtWidgets.QLineEdit("1.0")
         self._edit_multiplier.setToolTip("Image 2 is scaled by this before the subtraction")
         self._edit_multiplier.setValidator(QDoubleValidator())
         self._edit_multiplier.setMaximumWidth(80)
         self._edit_multiplier.editingFinished.connect(self._on_multiplier_changed)
-        chk_row.addWidget(self._edit_multiplier)
+        cursor_row.addWidget(self._edit_multiplier)
+        layout.addLayout(cursor_row)
 
-        chk_row.addStretch(1)
-        layout.addLayout(chk_row)
+        # --- metrics readout, alongside the comparison-region controls it scopes ---
+        metrics_row = QtWidgets.QHBoxLayout()
+        self._metrics_label = QtWidgets.QLabel()
+        self._metrics_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        metrics_row.addWidget(self._metrics_label, stretch=1)
+
+        self._chk_roi = QtWidgets.QCheckBox("select comparison region")
+        self._chk_roi.setToolTip(
+            "A resizable region of interest. Every measurement below is taken\n"
+            "over the part of it where both images overlap.\n"
+            "Drag inside the box to move it, its handles to resize it; drag\n"
+            "outside it to go on moving image 2."
+        )
+        self._chk_roi.toggled.connect(self._on_roi_enabled)
+        metrics_row.addWidget(self._chk_roi)
+
+        self._btn_align = QtWidgets.QPushButton("Align (phase correlation)")
+        self._btn_align.setToolTip(
+            "Phase-correlate the two images over the comparison region and move\n"
+            "image 2 onto image 1, to 1/%d of a pixel." % PHASE_CORR_UPSAMPLING
+        )
+        self._btn_align.clicked.connect(self.align_phase_correlation)
+        metrics_row.addWidget(self._btn_align)
+
+        self._chk_intensity = QtWidgets.QCheckBox("Intensity correction")
+        self._chk_intensity.setToolTip(
+            "Rescale image 2 linearly so that, inside the comparison region, it\n"
+            "has the same mean and standard deviation as image 1. The map is\n"
+            "derived from the region but applied to all of image 2, so the\n"
+            "display, its histogram, the subtraction and the metrics all see it."
+        )
+        self._chk_intensity.toggled.connect(self._on_intensity_toggled)
+        metrics_row.addWidget(self._chk_intensity)
+
+        self._btn_fsc = QtWidgets.QPushButton("Compute FSC")
+        self._btn_fsc.setToolTip(
+            "Fourier shell correlation over the comparison region, in its own window.\n"
+            "Reuses that window if it is already open, replacing its curves."
+        )
+        self._btn_fsc.clicked.connect(self.compute_fsc)
+        metrics_row.addWidget(self._btn_fsc)
+        layout.addLayout(metrics_row)
+
+        # The region starts off, so everything it scopes starts unavailable.
+        # _on_roi_enabled keeps the two in step from here on.
+        for w in (self._btn_align, self._chk_intensity, self._btn_fsc):
+            w.setEnabled(False)
 
         self.resize(900, 700)
 
@@ -225,6 +305,10 @@ class ImageCompareWindow(QtWidgets.QWidget):
             'label': self._source.info_text,
         }
         self._refresh_grid()
+        # The box may have been switched on before there was anything to centre
+        # it on, in which case this is the first chance to place it.
+        if self._chk_roi.isChecked() and not self._roi_placed:
+            self._place_roi()
         self._rebuild(autorange=True)
         self._sync_levels(index)
 
@@ -232,6 +316,64 @@ class ImageCompareWindow(QtWidgets.QWidget):
         """Put image 2 back at the origin of the common grid."""
         self._offset = QtCore.QPointF(0.0, 0.0)
         self._rebuild()
+
+    def align_phase_correlation(self):
+        """
+        Move image 2 onto image 1 by phase-correlating them inside the red box.
+
+        The crop of image 2 is taken at its current offset, so what comes back
+        is the *residual* misalignment and is added to the offset rather than
+        replacing it. Sub-pixel to 1/``PHASE_CORR_UPSAMPLING`` of a pixel.
+        """
+        ov1, ov2 = self._roi_overlap()
+        if ov1 is None or min(ov1.shape) < 4:
+            self._metrics_label.setText(
+                "Align: the two images do not overlap inside the red box."
+            )
+            return
+
+        try:
+            from skimage.registration import phase_cross_correlation
+        except ImportError:
+            self._metrics_label.setText(
+                "Align: needs scikit-image, which is not installed in this environment."
+            )
+            return
+
+        # Indexed rather than unpacked -- skimage's return arity has changed
+        # across versions, but the shift has always come first.
+        result = phase_cross_correlation(
+            np.nan_to_num(ov1), np.nan_to_num(ov2),
+            upsample_factor=PHASE_CORR_UPSAMPLING,
+        )
+        shift = np.asarray(result[0], dtype=float)   # (axis 0, axis 1) == (x, y)
+        if shift.size < 2 or not np.all(np.isfinite(shift)):
+            self._metrics_label.setText("Align: phase correlation returned no shift.")
+            return
+
+        self._offset = QtCore.QPointF(self._offset.x() + float(shift[0]),
+                                      self._offset.y() + float(shift[1]))
+        self._rebuild()
+
+    def compute_fsc(self):
+        """Open the FSC window on the two images' overlap inside the red box."""
+        ov1, ov2 = self._roi_overlap()
+        if ov1 is None:
+            self._metrics_label.setText(
+                "FSC: the two images do not overlap inside the red box."
+            )
+            return
+
+        from ._fsc import FscWindow
+        # Replaced rather than refreshed: each press is a snapshot of the
+        # current box and offset, and the old one may still be worth comparing.
+        self._fsc_window = FscWindow(
+            ov1, ov2, pixel_size_m=self._grid_pixel_size_m, parent=self
+        )
+        self._fsc_window.show()
+        self._fsc_window.raise_()
+        self._fsc_window.activateWindow()
+        return self._fsc_window
 
     @property
     def offset(self):
@@ -327,6 +469,90 @@ class ImageCompareWindow(QtWidgets.QWidget):
         return out
 
     # ------------------------------------------------------------------
+    # region of interest
+    # ------------------------------------------------------------------
+
+    def _overlap_bounds(self):
+        """
+        ``(xs, xe, ys, ye, ox, oy)`` in common-grid pixels, or None.
+
+        The region is the red box intersected with both images, image 2 sitting
+        at the integer-rounded drag offset ``(ox, oy)``. Everything measured in
+        this window is measured here, so the one place that gets the index
+        arithmetic right is this one. Note the pyqtgraph convention the rest of
+        the package follows: array axis 0 is x, so ``pos().x()`` indexes axis 0.
+        """
+        data1, data2 = self._grid_data
+        if not self._chk_roi.isChecked() or data1 is None or data2 is None:
+            return None
+
+        ox, oy = int(round(self._offset.x())), int(round(self._offset.y()))
+        pos, size = self._roi.pos(), self._roi.size()
+        bx0, bx1 = int(round(pos.x())), int(round(pos.x() + size.x()))
+        by0, by1 = int(round(pos.y())), int(round(pos.y() + size.y()))
+
+        xs = max(0, ox, bx0)
+        xe = min(data1.shape[0], ox + data2.shape[0], bx1)
+        ys = max(0, oy, by0)
+        ye = min(data1.shape[1], oy + data2.shape[1], by1)
+
+        if xe <= xs or ye <= ys:
+            return None
+        return xs, xe, ys, ye, ox, oy
+
+    def _roi_overlap(self, grid2=None):
+        """
+        ``(ov1, ov2)`` -- equally shaped views of both images over the red box.
+
+        ``(None, None)`` when the box is off, an image is missing, or the two
+        do not overlap inside it. ``grid2`` defaults to image 2 *after*
+        intensity correction, so callers see exactly what is on screen; the
+        correction itself passes the raw grid in to avoid chasing its own tail.
+        """
+        bounds = self._overlap_bounds()
+        if bounds is None:
+            return None, None
+        xs, xe, ys, ye, ox, oy = bounds
+
+        data2 = self._corrected2 if grid2 is None else grid2
+        if data2 is None:
+            return None, None
+        return (self._grid_data[0][xs:xe, ys:ye],
+                data2[xs - ox:xe - ox, ys - oy:ye - oy])
+
+    def _intensity_corrected(self):
+        """
+        Image 2's grid mapped onto image 1's mean and standard deviation.
+
+        The map is fitted inside the red box but applied to the whole array, so
+        image 2 stays internally consistent where it extends past the box. Sets
+        ``_intensity_map`` to the ``(gain, offset)`` actually applied, or None
+        when the correction is off or cannot be fitted.
+        """
+        grid2 = self._grid_data[1]
+        self._intensity_map = None
+        if grid2 is None or not self._chk_intensity.isChecked():
+            return grid2
+
+        ov1, ov2 = self._roi_overlap(grid2=grid2)
+        if ov1 is None:
+            return grid2
+
+        finite = np.isfinite(ov1) & np.isfinite(ov2)
+        if finite.sum() < 2:
+            return grid2
+        a, b = ov1[finite], ov2[finite]
+
+        std2 = float(b.std())
+        # A flat image 2 has no spread to match -- shift it onto image 1's mean
+        # and leave it at that rather than dividing by zero.
+        gain = float(a.std()) / std2 if std2 > 0 else 1.0
+        offset = float(a.mean()) - gain * float(b.mean())
+
+        self._intensity_map = (gain, offset)
+        return (grid2 * gain + offset).astype(np.float32)
+
+    # ------------------------------------------------------------------
     # display
     # ------------------------------------------------------------------
 
@@ -340,11 +566,16 @@ class ImageCompareWindow(QtWidgets.QWidget):
         subtract = self._chk_subtract.isChecked()
         side_by_side = self._chk_side_by_side.isChecked() and not subtract
 
+        # Intensity correction sits between the grid and everything downstream,
+        # so the overlay, the histogram, the difference and the metrics are all
+        # looking at the same corrected array.
+        self._corrected2 = self._intensity_corrected()
+
         # Image 1 is left alone either way; only the image 2 slot becomes the
         # difference, so the two histograms keep their separate meanings.
-        self._displayed = list(self._grid_data)
+        self._displayed = [self._grid_data[0], self._corrected2]
         if subtract:
-            self._displayed[1] = self._difference(*self._grid_data)
+            self._displayed[1] = self._difference(self._grid_data[0], self._corrected2)
         elif side_by_side:
             # Adjacent, both solid. Shapes need not match -- nothing is padded.
             width1 = self._grid_data[0].shape[0] if self._grid_data[0] is not None else 0
@@ -362,24 +593,36 @@ class ImageCompareWindow(QtWidgets.QWidget):
                 # checkbox or a drag must not throw their levels away.
                 item.setImage(data, autoLevels=item.levels is None)
 
-        show1 = data1 is not None and not self._chk_hide1.isChecked()
+        # One image at a time is always fully opaque -- transparency only earns
+        # its keep when there is a second image underneath to see.
+        show_both = self._chk_show_both.isChecked()
+        if show_both:
+            show1, show2 = True, True
+            opacity2 = 1.0 if side_by_side else IMAGE2_OPACITY
+        else:
+            only1 = self._chk_show_only1.isChecked()
+            show1, show2 = only1, not only1
+            opacity2 = 1.0
+
+        show1 = show1 and data1 is not None
+        show2 = show2 and data2 is not None
 
         self._img1.setPos(0.0, 0.0)
         self._img2.setPos(*self._image2_origin)
-        # Image 2 is only ever see-through when there is something to see
-        # through it to -- solid side by side, and solid once image 1 is hidden.
-        self._img2.setOpacity(IMAGE2_OPACITY if show1 and not side_by_side else 1.0)
+        self._img2.setOpacity(opacity2)
         self._img2.draggable = not side_by_side
 
         self._img1.setVisible(show1)
-        self._img2.setVisible(data2 is not None and not self._chk_hide2.isChecked())
+        self._img2.setVisible(show2)
 
         self._chk_side_by_side.setEnabled(not subtract)
+        self._chk_show_only1.setEnabled(not show_both)
         self._btn_reset.setEnabled(not side_by_side)
 
         if autorange:
             self._plot.getViewBox().autoRange()
         self._update_info()
+        self._update_metrics()
 
     def _sync_levels(self, index):
         """
@@ -410,16 +653,20 @@ class ImageCompareWindow(QtWidgets.QWidget):
     def _on_subtract_toggled(self, checked):
         """
         Subtract owns the layout: side-by-side is cleared and locked out, and
-        image 1 is hidden, the difference already carrying it. Both remain the
-        user's to change afterwards; turning subtract back off restores whatever
-        "Hide image 1" was before.
+        only the difference is shown, it already carrying image 1. The
+        visibility boxes remain the user's to change afterwards; turning
+        subtract back off restores whatever they were before.
         """
         if checked:
-            self._hide1_before_subtract = self._chk_hide1.isChecked()
+            self._vis_before_subtract = (self._chk_show_both.isChecked(),
+                                         self._chk_show_only1.isChecked())
             self._chk_side_by_side.setChecked(False)   # each may rebuild on its own
-            self._chk_hide1.setChecked(True)
-        else:
-            self._chk_hide1.setChecked(self._hide1_before_subtract)
+            self._chk_show_both.setChecked(False)
+            self._chk_show_only1.setChecked(False)     # i.e. the image 2 slot alone
+        elif self._vis_before_subtract is not None:
+            show_both, show_only1 = self._vis_before_subtract
+            self._chk_show_both.setChecked(show_both)
+            self._chk_show_only1.setChecked(show_only1)
         self._rebuild(autorange=True)
         # The difference straddles zero -- nothing like image 2's own range
         self._sync_levels(1)
@@ -428,6 +675,61 @@ class ImageCompareWindow(QtWidgets.QWidget):
         self._rebuild()
         if self._chk_subtract.isChecked():
             self._sync_levels(1)
+
+    def _on_roi_enabled(self, checked):
+        """
+        Show or hide the red box and everything it scopes.
+
+        The box is centred on image 1 the first time it appears and then left
+        where the user puts it, the same rule the lineout's metric cursors
+        follow. Turning it off drops the intensity correction with it, which
+        moves image 2's range, hence the re-level.
+        """
+        if checked and not self._roi_placed:
+            self._place_roi()
+        self._roi.setVisible(checked)
+        for w in (self._btn_align, self._chk_intensity, self._btn_fsc):
+            w.setEnabled(checked)
+
+        self._rebuild()
+        if self._chk_intensity.isChecked():
+            self._sync_levels(1)
+
+    def _place_roi(self):
+        """Centre the box on image 1 (or image 2, failing that) at half its extent."""
+        data = self._grid_data[0]
+        if data is None:
+            data = self._grid_data[1]
+        if data is None:
+            return
+
+        w = max(data.shape[0] * ROI_INITIAL_FRAC, 4.0)
+        h = max(data.shape[1] * ROI_INITIAL_FRAC, 4.0)
+        self._roi.blockSignals(True)
+        self._roi.setSize([w, h])
+        self._roi.setPos([(data.shape[0] - w) / 2, (data.shape[1] - h) / 2])
+        self._roi.blockSignals(False)
+        self._roi_placed = True
+
+    def _on_roi_changed(self):
+        """
+        The box moved or was resized.
+
+        Only the metrics need redoing, unless the intensity correction is on --
+        its map is fitted inside the box, so moving the box changes the pixels.
+        """
+        if self._chk_intensity.isChecked():
+            self._rebuild()
+        else:
+            self._update_metrics()
+
+    def _on_intensity_toggled(self, _checked):
+        """
+        Not wired straight to ``_rebuild``: the correction rescales image 2, so
+        its histogram has to follow it onto the new range.
+        """
+        self._rebuild()
+        self._sync_levels(1)
 
     def _on_image2_dragged(self, delta, is_start):
         """Apply a drag delta to the offset. Placement is _rebuild's business."""
@@ -507,4 +809,54 @@ class ImageCompareWindow(QtWidgets.QWidget):
             offset_text += "  — dragging disabled"
         lines.append(offset_text)
 
+        if self._intensity_map is not None:
+            lines.append(
+                "Intensity correction: image 2 × %.4g %+.4g"
+                % (self._intensity_map[0], self._intensity_map[1])
+            )
+
         self._info_label.setText("\n".join(lines))
+
+    def _update_metrics(self):
+        """
+        PSNR, MSE and the offset over the red box's overlap.
+
+        Each degenerate case gets said out loud rather than showing a NaN --
+        "no overlap" and "the images are identical" are different answers and
+        both are worth knowing.
+        """
+        if not self._chk_roi.isChecked():
+            self._metrics_label.setText('')
+            return
+
+        ov1, ov2 = self._roi_overlap()
+        if ov1 is None:
+            self._metrics_label.setText(
+                "Red box: the two images do not overlap inside it."
+            )
+            return
+
+        finite = np.isfinite(ov1) & np.isfinite(ov2)
+        if not finite.any():
+            self._metrics_label.setText("Red box: no finite values in the overlap.")
+            return
+        a, b = ov1[finite], ov2[finite]
+
+        mse = float(np.mean((a - b) ** 2))
+        data_range = float(a.max() - a.min())
+        if mse <= 0:
+            psnr_text = "PSNR: ∞ dB (identical)"
+        elif data_range <= 0:
+            psnr_text = "PSNR: — (image 1 is flat here)"
+        else:
+            psnr_text = "PSNR: %.2f dB" % (10.0 * np.log10(data_range ** 2 / mse))
+
+        dx, dy = self._offset.x(), self._offset.y()
+        self._metrics_label.setText(
+            "Red box overlap: %d×%d px   offset: %.2f, %.2f px (%.3f, %.3f µm)\n"
+            "MSE: %.4g   %s"
+            % (ov1.shape[0], ov1.shape[1], dx, dy,
+               dx * self._grid_pixel_size_m * 1e6,
+               dy * self._grid_pixel_size_m * 1e6,
+               mse, psnr_text)
+        )
