@@ -57,7 +57,7 @@ skip simply do not appear::
             self.plot.add_menu_action("Copy File Path", self._copy_path, at_top=True)
             self.act_full = self.plot.add_menu_action(
                 "Full Probe Zoom", checkable=True,
-                after=self.plot.action_auto_reset_zoom,
+                after=self.plot.action_no_zoom_tracking,
             )
 
         def show_array(self, arr, pixel_size_m, caption):

@@ -13,6 +13,7 @@ import pyqtgraph as pg
 
 from scan_watcher_thread import ScanWatcherThread
 from pg_image_tools import ImagePlotWidget
+from image_stack_window import ImageStackWindow
 
 TREE_CACHE_FILENAME = "ptychi_file_browser_tree_cache.csv"
 
@@ -159,6 +160,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._log_bad_by_scan = {}     # "S0042" -> bool, mirrors scan_bad_list.csv
         self._log_csv_stat = None      # (st_mtime, st_size) guard
         self.runtable_window = None    # non-blocking viewer, kept alive on self
+        self._image_stack_windows = []  # non-blocking builder windows, kept alive on self
         self._runtable_updating = False  # guard against itemChanged while rebuilding
 
         # ---- runtable plot pane (built lazily by the 'Show Plots' button) ----
@@ -233,6 +235,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.toolButton_tips.clicked.connect(self.show_secret_features)
         self.pushButton_addScan.clicked.connect(self.on_add_scan_clicked)
         self.pushButton_viewRuntable.clicked.connect(self.show_runtable_window)
+        self.pushButton_createImageStack.clicked.connect(self.show_image_stack_window)
 
 
     def _setup_pyqtgraph_view(self):
@@ -263,7 +266,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         # "Full Probe Zoom" toggle — when checked, skip the square crop zoom
         self._full_probe_zoom_action = self.plot.add_menu_action(
             "Full Probe Zoom", checkable=True,
-            after=self.plot.action_auto_reset_zoom,
+            after=self.plot.action_auto_colorscale,
         )
 
 
@@ -336,7 +339,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                           
         Populating
         --- Set Base Path and click Populate tree to start
-        --- Populate tree is slow, so afterwards try to add each scan manually or use scan auto updater
+        --- Populate tree is slow:
+        ----- Try to save/load tree (as csv file), add each scan manually, or use scan auto updater
 
         Tree Navigation
         --- Up / Down    → switch scan number
@@ -350,10 +354,9 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         Plot
         --- Click on two points to get distance and lineout
         --- Open lineout viewer with right-click on plot
-        ----- Lineout viewer can be used to find the 25%-75% resolution
-        ----- Drag the blue and green lines to the boundaries of a hard edge, and the right-click menu will calculate it
+        ----- Lineout viewer right-click menu can be used to find the 25%-75% resolution or fit an error function
         --- By default, probe viewer is centered on mode 0, and the right-click menu can turn this off
-        --- Right-click menu can copy parameter folder string (Ndp256...)
+        --- Right-click menu can copy parameter folder string (Ndp256...) or full path
         --- Right-click menu can change default zoom behavior ("View All" resets the zoom)
 
         Scan goodness
@@ -362,7 +365,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         
         Sample names
         --- Taken from the log csv first, then old 'runtable_full_.csv', then a dash
-        --- Files must be located in parent of base path
+        --- Log/runtable files must be located in parent of base path
 
         Log CSV / Runtable
         --- On Populate tree or Load tree, searches parent of base path for .csv files
@@ -370,9 +373,10 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         --- "View Runtable" opens a filtered, color-coded table in its own window
         ----- Red means ignore this run. Yellow means needs reconstruction. Green means all good
         ----- "Bad" checkbox saved between sessions, allows manual control
-        ----- "Show Plots" splits the window and plots a diffraction pattern and the scan positions
-        ------- Also tries to calculate number of diffraction patterns/positions
         ------- Blue positions are nominal, taken from a master.h5 when no "_para." file is found
+
+        Create Image Stack
+        --- Used to create tif or h5 image stack, optional cropping/phase correlation alignment
 
         Scan Auto Updater
         --- Every 10.0 s, checks a file "recon_completed.csv"
@@ -1503,6 +1507,23 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         return item
 
 
+    def show_image_stack_window(self):
+        """
+        Open a new, independent image-stack builder window, seeded with
+        whatever image is currently displayed. Unlike the runtable viewer,
+        each click opens a fresh window (kept alive in a list) since a new
+        stack naturally starts from whatever is currently selected.
+        """
+        window = ImageStackWindow(
+            self,
+            self.comboBox_imageChoice.currentText(),
+            self.base_path,
+            self.file_load_path,
+        )
+        self._image_stack_windows.append(window)
+        window.show()
+
+
     def show_runtable_window(self):
         """
         Open the runtable viewer: a non-blocking, color-coded view of the
@@ -2095,6 +2116,87 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
 
 
+    @staticmethod
+    def resolve_display_path(recon_file: Path, extension: str) -> Path:
+        """
+        Map a recon_NiterN.h5 file plus a comboBox_imageChoice extension choice
+        to the actual sibling file that choice refers to.
+        """
+        if extension == 'recon_NiterXXX.h5':
+            return recon_file
+
+        elif extension in ('recon_NiterXXX_ph.h5', 'recon_NiterXXX_mag.h5', 'recon_NiterXXX_pos.h5'):
+            return recon_file
+
+        elif extension in ('dp_sum.tiff', 'init_probe_mag.tiff'):
+            return recon_file.parent / extension
+
+        elif extension == 'init_positions.png':
+            return recon_file.parent / extension
+
+        else:
+            base = extension.rsplit("Niter", 1)[0]
+            suffix = recon_file.stem.split("recon_", 1)[1]
+            return recon_file.parent / f"{base}{suffix}{Path(extension).suffix}"
+
+
+    @staticmethod
+    def read_image_and_pixel_size(file_path: Path, extension: str):
+        """
+        Read pixel data and pixel size (meters) from an already-resolved
+        display file, dispatching purely on file suffix (and, for h5, on the
+        mag/ph extension choice). Does not touch any browser state.
+
+        Parameters
+        ----------
+        file_path : Path
+        extension : str
+            The comboBox_imageChoice text used to resolve file_path -- only
+            consulted to distinguish magnitude vs. phase for .h5 files.
+
+        Returns
+        -------
+        (data, pixel_size_m, positions_px) : (2d numpy array, float, np.ndarray | None)
+        """
+        positions_px = None
+
+        if file_path.suffix in ('.h5', '.hdf5'):
+            with h5py.File(file_path, 'r') as f:
+                if extension == 'recon_NiterXXX_mag.h5':
+                    obj = np.abs(f['object'][0][()]).T
+                else:
+                    obj = np.angle(f['object'][0][()]).T
+                pixel_size_m = float(f['obj_pixel_size_m'][()])
+                if extension == 'recon_NiterXXX_pos.h5' and 'positions_px' in f:
+                    positions_px = f['positions_px'][()]
+
+        elif file_path.suffix in ('.tiff',):
+            pixel_size_m = None
+            with tifffile.TiffFile(file_path) as tif:
+                obj = tif.asarray()
+                if 'pixel_size' in tif.imagej_metadata.keys():
+                    pixel_size_m = 1e-6 * tif.imagej_metadata['pixel_size']
+
+                elif 'xspacing' in tif.imagej_metadata.keys():
+                    pixel_size_m = 1e-6 * tif.imagej_metadata['xspacing']
+
+                if len(obj.shape) == 3:
+                    obj = np.mean(obj, 2).T
+
+                if 'object_' in file_path.stem:
+                    obj = obj.T
+
+        elif file_path.suffix in ('.png',):
+            pixel_size_m = None
+            obj = Image.open(file_path).convert("L")  # L = grayscale
+            obj = np.array(obj, dtype=np.float32).T
+
+        else:
+            raise ValueError(f"Unsupported image file suffix: {file_path.suffix}")
+
+        return obj, pixel_size_m, positions_px
+
+
     def load_data_from_file(self, file_path: Path):
         """
         loading data from a file.
@@ -2110,56 +2212,15 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         extension = self.comboBox_imageChoice.currentText()
         self._positions_px = None  # reset on every load
 
-        if extension == 'recon_NiterXXX.h5':
-            self.file_load_path = file_path
-
-        elif extension in ('recon_NiterXXX_ph.h5', 'recon_NiterXXX_mag.h5', 'recon_NiterXXX_pos.h5'):
-            variant = extension[len('recon_NiterXXX'):]   # e.g. "_ph.h5"
-            self.file_load_path = file_path
-            # self.file_load_path = file_path.parent / f"{file_path.stem}{variant}"
-
-        elif extension in ('dp_sum.tiff', 'init_probe_mag.tiff'):
-            self.file_load_path = file_path.parent / extension
-
-        elif extension == 'init_positions.png':
-            self.file_load_path = file_path.parent / extension
-
-        else:
-            base = extension.rsplit("Niter", 1)[0]
-            suffix = file_path.stem.split("recon_", 1)[1]
-            self.file_load_path = file_path.parent / f"{base}{suffix}{Path(extension).suffix}"
+        self.file_load_path = self.resolve_display_path(file_path, extension)
 
         if not self.file_load_path.exists():
             return None
 
-        if self.file_load_path.suffix in ('.h5', '.hdf5'):
-            with h5py.File(self.file_load_path, 'r') as f:
-                if extension == 'recon_NiterXXX_mag.h5':
-                    obj = np.abs(f['object'][0][()]).T
-                else:
-                    obj = np.angle(f['object'][0][()]).T
-                self.res_m = float(f['obj_pixel_size_m'][()])
-                if extension == 'recon_NiterXXX_pos.h5' and 'positions_px' in f:
-                    self._positions_px = f['positions_px'][()]
-
-        elif self.file_load_path.suffix in ('.tiff',):
-            with tifffile.TiffFile(self.file_load_path) as tif:
-                obj = tif.asarray()
-                if 'pixel_size' in tif.imagej_metadata.keys():
-                    self.res_m = 1e-6 * tif.imagej_metadata['pixel_size']
-
-                elif 'xspacing' in tif.imagej_metadata.keys():
-                    self.res_m = 1e-6 * tif.imagej_metadata['xspacing']
-
-                if len(obj.shape) == 3:
-                    obj = np.mean(obj, 2).T
-
-                if 'object_' in self.file_load_path.stem:
-                    obj = obj.T
-
-        elif self.file_load_path.suffix in ('.png',):
-            obj = Image.open(self.file_load_path).convert("L")  # L = grayscale
-            obj = np.array(obj, dtype=np.float32).T
+        obj, pixel_size_m, positions_px = self.read_image_and_pixel_size(self.file_load_path, extension)
+        if pixel_size_m is not None:
+            self.res_m = pixel_size_m
+        self._positions_px = positions_px
 
         return obj
 
@@ -2933,6 +2994,78 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         self._empty_delete_plan = []
 
+    def _build_pattern_delete_plan(self, first_num: int, last_num: int, pattern: str) -> list:
+        """
+        Plan the removal of the param folder named `pattern` from every scan in a range.
+
+        Returns a list of dicts, one per affected scan:
+            {'scan_name', 'scan_path', 'param_paths', 'delete_scan'}
+        'delete_scan' is True when the scan is left with no param folders at all.
+        """
+        plan = []
+        for n in range(min(first_num, last_num), max(first_num, last_num) + 1):
+            scan_path = self.base_path / f"S{n:04d}"
+            if not scan_path.is_dir():
+                continue
+            try:
+                subdirs = sorted(d for d in scan_path.iterdir() if d.is_dir())
+            except PermissionError:
+                continue
+
+            matches = [d for d in subdirs if d.name == pattern]
+            if not matches:
+                continue
+
+            delete_scan = len(matches) == len(subdirs)
+            plan.append({
+                'scan_name': scan_path.name,
+                'scan_path': scan_path,
+                'param_paths': matches,
+                'delete_scan': delete_scan,
+            })
+        return plan
+
+    def _collect_all_pattern_delete_paths(self, first_num: int, last_num: int, pattern: str) -> list:
+        """Collect the matching param folders (and emptied scan folders) across a scan range."""
+        self._pattern_delete_plan = self._build_pattern_delete_plan(first_num, last_num, pattern)
+        all_paths = []
+        for entry in self._pattern_delete_plan:
+            all_paths.extend(entry['param_paths'])
+            if entry['delete_scan']:
+                all_paths.append(entry['scan_path'])
+        return all_paths
+
+    def _apply_pattern_deletions(self, first_num: int, last_num: int, all_paths: list):
+        """Delete the folders planned by the most recent _collect_all_pattern_delete_paths call."""
+        for entry in getattr(self, '_pattern_delete_plan', []):
+            scan_name = entry['scan_name']
+
+            for param_path in entry['param_paths']:
+                if param_path.exists():
+                    shutil.rmtree(param_path)
+                if scan_name in self._seen_param_folders:
+                    self._seen_param_folders[scan_name].discard(param_path)
+                if scan_name in self._seen_recon_files:
+                    self._seen_recon_files[scan_name].pop(param_path.name, None)
+
+            if entry['delete_scan']:
+                if entry['scan_path'].exists():
+                    shutil.rmtree(entry['scan_path'])
+                row_item = self._scan_row_items.get(scan_name)
+                if row_item is not None:
+                    self._remove_scan_row(scan_name, row_item)
+                else:
+                    self._seen_scans.discard(scan_name)
+                    self._seen_param_folders.pop(scan_name, None)
+                    self._seen_recon_files.pop(scan_name, None)
+            elif scan_name in self._scan_row_items:
+                # Row may still point at a folder that is now gone, so rebuild it
+                self._seen_param_folders.pop(scan_name, None)
+                self._seen_recon_files.pop(scan_name, None)
+                self._refresh_scan_row(entry['scan_path'])
+
+        self._pattern_delete_plan = []
+
     def _apply_intermediate_deletions(self, first_num: int, last_num: int, all_paths: list):
         """Unlink every collected intermediate recon file and update the trackers."""
         for p in all_paths:
@@ -2955,7 +3088,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         layout.addWidget(QtWidgets.QLabel(
             "Delete intermediate: remove all but the last iteration in every parameter folder.\n"
-            "Delete empty: remove parameter folders with no recon file, and scans left with none."))
+            "Delete empty: remove parameter folders with no recon file, and scans left with none.\n"
+            "Delete parameter folder pattern: remove the same-named parameter folder from every scan in range."))
 
         btn_row = QtWidgets.QHBoxLayout()
         intermediate_btn = QtWidgets.QPushButton("Delete intermediate")
@@ -2970,6 +3104,12 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         empty_btn.setDefault(False)
         empty_btn.clicked.connect(lambda: (dlg.accept(), self.show_delete_empty_tool()))
 
+        pattern_btn = QtWidgets.QPushButton("Delete parameter folder pattern")
+        pattern_btn.setStyleSheet("background-color: red; color: white; padding: 4px 16px;")
+        pattern_btn.setAutoDefault(False)
+        pattern_btn.setDefault(False)
+        pattern_btn.clicked.connect(lambda: (dlg.accept(), self.show_delete_pattern_tool()))
+
         cancel_btn = QtWidgets.QPushButton("Cancel")
         cancel_btn.setStyleSheet("background-color: green; color: white; padding: 4px 16px;")
         cancel_btn.setDefault(True)
@@ -2978,6 +3118,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         btn_row.addWidget(intermediate_btn)
         btn_row.addWidget(empty_btn)
+        btn_row.addWidget(pattern_btn)
         btn_row.addWidget(cancel_btn)
         layout.addLayout(btn_row)
 
@@ -3001,6 +3142,94 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             self._apply_empty_deletions,
             "No empty parameter folders found in the given range.",
         )
+
+    def show_delete_pattern_tool(self):
+        """Open a dialog to delete a same-named parameter folder across a scan range."""
+        default_pattern = ""
+        item = self.treeWidget_fileStructure.currentItem()
+        if item is not None:
+            param_path = item.data(1, Qt.UserRole)
+            if param_path is not None:
+                default_pattern = Path(param_path).name
+
+        max_scan_num = 0
+        for scan_name in self._seen_scans:
+            if len(scan_name) == 5 and scan_name.startswith("S") and scan_name[1:].isdigit():
+                max_scan_num = max(max_scan_num, int(scan_name[1:]))
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Delete Parameter Folder Pattern")
+        layout = QtWidgets.QVBoxLayout(dlg)
+
+        layout.addWidget(QtWidgets.QLabel("Parameter folder name to delete from every scan in range:"))
+        pattern_edit = QtWidgets.QLineEdit(default_pattern)
+        layout.addWidget(pattern_edit)
+
+        layout.addWidget(QtWidgets.QLabel("First scan in range:"))
+        combo_first = QtWidgets.QComboBox()
+        combo_first.setEditable(True)
+        for idx in range(1, 11):
+            combo_first.addItem(f"S{max_scan_num + idx:04d}")
+        layout.addWidget(combo_first)
+
+        layout.addWidget(QtWidgets.QLabel("Last scan in range:"))
+        combo_last = QtWidgets.QComboBox()
+        combo_last.setEditable(True)
+        for idx in range(1, 11):
+            combo_last.addItem(f"S{max_scan_num + idx:04d}")
+        layout.addWidget(combo_last)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        confirm_btn = QtWidgets.QPushButton("Confirm files")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(confirm_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        def parse_scan(text):
+            t = text.strip()
+            if len(t) == 5 and t.startswith("S") and t[1:].isdigit():
+                return int(t[1:])
+            return None
+
+        def on_confirm():
+            pattern = pattern_edit.text().strip()
+            if not pattern:
+                QtWidgets.QMessageBox.warning(dlg, "Invalid Pattern",
+                    "Enter the parameter folder name to delete.")
+                return
+
+            first_text = combo_first.currentText().strip()
+            last_text = combo_last.currentText().strip()
+            first_num = parse_scan(first_text)
+            last_num = parse_scan(last_text)
+            if first_num is None:
+                QtWidgets.QMessageBox.warning(dlg, "Invalid Format",
+                    f"Invalid scan name: {first_text}\nExpected: S#### (e.g., S0042)")
+                return
+            if last_num is None:
+                QtWidgets.QMessageBox.warning(dlg, "Invalid Format",
+                    f"Invalid scan name: {last_text}\nExpected: S#### (e.g., S0042)")
+                return
+
+            all_paths = self._collect_all_pattern_delete_paths(first_num, last_num, pattern)
+            if not all_paths:
+                QtWidgets.QMessageBox.information(dlg, "Nothing to delete",
+                    f"No parameter folder named '{pattern}' found in the given range.")
+                return
+
+            header = f"Delete parameter folder '{pattern}' from range:\n{first_text}\n{last_text}"
+            if not self._confirm_delete(header, all_paths, relative_to=self.base_path):
+                return
+
+            self._apply_pattern_deletions(first_num, last_num, all_paths)
+
+            dlg.accept()
+
+        confirm_btn.clicked.connect(on_confirm)
+        dlg.resize(380, 220)
+        dlg.exec()
 
     def _show_delete_range_tool(self, window_title, collect_fn, delete_fn, nothing_msg):
         """

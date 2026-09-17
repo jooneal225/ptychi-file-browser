@@ -3,3 +3,6 @@ __pycache__/
 .idea/
 .vscode/
 run_ptychi_file_browser.bat
+_temp*
+_tmp*
+_smoke*

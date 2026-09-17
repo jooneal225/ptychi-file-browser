@@ -180,7 +180,41 @@ class ImagePlotWidget(QtWidgets.QWidget):
         self._menu = self.pg_view.getView().menu
         self._menu_anchor = None
 
+        # Zoom-on-image-change behavior is a three-way switch -- exactly one of
+        # these is active at a time (see set_image()) -- set off from the rest
+        # of the menu by a separator on each side.
         self._own_add_separator()
+
+        self.action_auto_reset_zoom = QtWidgets.QAction("Auto-reset Zoom")
+        self.action_auto_reset_zoom.setCheckable(True)
+        self._own_add_action(self.action_auto_reset_zoom)
+
+        # When checked, the view range from just before an image change is
+        # remapped onto the new image using the ratio of pixel sizes, so the
+        # same physical field of view (position + zoom) stays framed even if
+        # the new image has a different pixel size and/or shape.
+        self.action_track_zoom = QtWidgets.QAction("Track Zoom")
+        self.action_track_zoom.setCheckable(True)
+        self._own_add_action(self.action_track_zoom)
+
+        self.action_no_zoom_tracking = QtWidgets.QAction("Neither")
+        self.action_no_zoom_tracking.setCheckable(True)
+        self._own_add_action(self.action_no_zoom_tracking)
+
+        self._zoom_mode_group = QtWidgets.QActionGroup(self)
+        self._zoom_mode_group.setExclusive(True)
+        for action in (self.action_auto_reset_zoom, self.action_track_zoom,
+                       self.action_no_zoom_tracking):
+            self._zoom_mode_group.addAction(action)
+        self.action_auto_reset_zoom.setChecked(True)
+
+        self.action_zoom_mode_separator = self._own_add_separator()
+
+        self.action_auto_colorscale = QtWidgets.QAction("Auto colorscale")
+        self.action_auto_colorscale.setCheckable(True)
+        self.action_auto_colorscale.setChecked(True)
+        self.action_auto_colorscale.triggered.connect(self._on_auto_colorscale_toggled)
+        self._own_add_action(self.action_auto_colorscale)
 
         self.action_lineout = None
         if self.lineout is not None:
@@ -188,12 +222,6 @@ class ImagePlotWidget(QtWidgets.QWidget):
             self.action_lineout.setCheckable(True)
             self.action_lineout.triggered.connect(self.set_lineout_visible)
             self._own_add_action(self.action_lineout)
-
-        # No "Reset Zoom" entry — pyqtgraph's built-in "View All" already does it.
-        self.action_auto_reset_zoom = QtWidgets.QAction("Auto-reset Zoom")
-        self.action_auto_reset_zoom.setCheckable(True)
-        self.action_auto_reset_zoom.setChecked(True)
-        self._own_add_action(self.action_auto_reset_zoom)
 
         self.action_compare = None
         if self._enable_compare:
@@ -256,7 +284,7 @@ class ImagePlotWidget(QtWidgets.QWidget):
 
         at_top : insert above this widget's own block (below pyqtgraph's builtins).
                  Successive at_top calls keep their relative order.
-        after  : insert directly after the given QAction (e.g. ``action_auto_reset_zoom``).
+        after  : insert directly after the given QAction (e.g. ``action_no_zoom_tracking``).
                  Takes precedence over ``at_top``.
         """
         action = QtWidgets.QAction(text, self)
@@ -343,6 +371,12 @@ class ImagePlotWidget(QtWidgets.QWidget):
         self.redraw()
         self.sigRedrawRequested.emit()
 
+    def _on_auto_colorscale_toggled(self, *_):
+        # Re-checking it should snap the colorbar back to the current data now,
+        # rather than waiting for the next image.
+        self.redraw()
+        self.sigRedrawRequested.emit()
+
     # ------------------------------------------------------------------
     # display
     # ------------------------------------------------------------------
@@ -357,6 +391,15 @@ class ImagePlotWidget(QtWidgets.QWidget):
         data = np.asarray(data)
         if data.ndim != 2:
             raise ValueError("set_image expects a 2D numpy array")
+
+        # Captured from the outgoing image, before anything below overwrites
+        # it, so the tracked view reflects wherever the user last left it
+        # (not wherever it was when "Track Zoom" was checked).
+        track_zoom = self.action_track_zoom.isChecked() and self._displayed_shape is not None
+        if track_zoom:
+            tracked_range = self.pg_view.getView().viewRange()
+            tracked_pixel_size = self._pixel_size_m
+            tracked_shape = self._displayed_shape
 
         self._raw_data = data
         self._pixel_size_m = float(pixel_size_m)
@@ -374,9 +417,12 @@ class ImagePlotWidget(QtWidgets.QWidget):
         self.clear_scatter_overlay()
 
         if autoRange is None:
-            autoRange = self.action_auto_reset_zoom.isChecked()
+            autoRange = self.action_auto_reset_zoom.isChecked() and not track_zoom
         self._render(autoRange=autoRange)   # sets self._displayed_shape for the new data
         self._update_lineout()
+
+        if track_zoom:
+            self._apply_tracked_zoom(tracked_range, tracked_pixel_size, tracked_shape)
 
         if (self._unwrap_enabled and self._unwrap_kind in ('rect', 'circle')
                 and self._unwrap_roi is None):
@@ -454,13 +500,20 @@ class ImagePlotWidget(QtWidgets.QWidget):
             floor = float(positive.min()) if positive.size else np.finfo(np.float32).tiny
             data = np.log10(np.clip(mag, a_min=floor, a_max=None))
 
-        self.pg_view.setImage(data, autoLevels=True, autoRange=autoRange)
+        auto_colorscale = self.action_auto_colorscale.isChecked()
+        # ImageView's own autoRange kwarg is unreliable once a view has
+        # already been panned/zoomed once, so drive the reset ourselves
+        # (same reasoning as _apply_tracked_zoom driving Track Zoom itself).
+        self.pg_view.setImage(data, autoLevels=auto_colorscale, autoRange=False)
+        if autoRange:
+            self.pg_view.getView().autoRange()
 
         if not self._colorbar_added:
             self.pg_view.ui.histogram.show()
             self._colorbar_added = True
 
-        self._sync_levels(data)
+        if auto_colorscale:
+            self._sync_levels(data)
 
     def _sync_levels(self, data):
         """
@@ -525,6 +578,34 @@ class ImagePlotWidget(QtWidgets.QWidget):
             return
         ny = self._displayed_shape[1]   # vertical height H
         self.pg_view.getView().setRange(xRange=(0, ny), yRange=(0, ny), padding=padding)
+
+    def _apply_tracked_zoom(self, old_range, old_pixel_size, old_shape):
+        """
+        Re-apply a view range captured on the previous image to the new one.
+
+        Each axis is remapped relative to that image's own center (rather
+        than its pixel-0 corner), then rescaled by the ratio of pixel sizes.
+        A view centered on the old image is therefore still centered on the
+        new one, and an off-center crop keeps the same physical offset, even
+        when pixel size and/or image shape changed between the two.
+        """
+        if self._displayed_shape is None or not old_pixel_size:
+            return
+        new_shape = self._displayed_shape
+        scale = old_pixel_size / self._pixel_size_m if self._pixel_size_m else 1.0
+
+        def remap(lo, hi, old_n, new_n):
+            center = (lo + hi) / 2
+            half = (hi - lo) / 2
+            rel_phys = (center - old_n / 2) * scale
+            new_center = new_n / 2 + rel_phys
+            new_half = half * scale
+            return new_center - new_half, new_center + new_half
+
+        (x0, x1), (y0, y1) = old_range
+        new_x = remap(x0, x1, old_shape[0], new_shape[0])
+        new_y = remap(y0, y1, old_shape[1], new_shape[1])
+        self.pg_view.getView().setRange(xRange=new_x, yRange=new_y, padding=0)
 
     # ------------------------------------------------------------------
     # overlays

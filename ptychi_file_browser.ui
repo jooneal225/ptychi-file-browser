@@ -332,6 +332,21 @@
          </widget>
         </item>
         <item>
+         <widget class="QPushButton" name="pushButton_createImageStack">
+          <property name="font">
+           <font>
+            <pointsize>10</pointsize>
+           </font>
+          </property>
+          <property name="toolTip">
+           <string>Build a 3D stack from several same-type images</string>
+          </property>
+          <property name="text">
+           <string>Create Image Stack</string>
+          </property>
+         </widget>
+        </item>
+        <item>
          <widget class="QCheckBox" name="checkBox_transpose">
           <property name="font">
            <font>
