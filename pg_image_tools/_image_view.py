@@ -926,7 +926,7 @@ class ImagePlotWidget(QtWidgets.QWidget):
             if 0 <= xi < nx and 0 <= yi < ny:
                 intens = img_item.image[xi, yi]
                 self._info_label.setText(
-                    f"{base}\nx={x_um:.2f}, y={y_um:.2f} µm, I={intens:.2g}"
+                    f"{base}\nx={x_um:.2f}, y={y_um:.2f} µm, I={intens:.3g}"
                 )
             else:
                 self._info_label.setText(f"{base}\nx={x_um:.2f}, y={y_um:.2f} µm")
@@ -978,7 +978,18 @@ class ImagePlotWidget(QtWidgets.QWidget):
                 px, py = 0, offset
             self._distance_text.setPos((x1 + x2) / 2 + px, (y1 + y2) / 2 + py)
             dist_px = int(round(np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)))
-            self._distance_text.setText(f"{dist_um:.3f} µm\n{dist_px} pix")
+            nx, ny = img_item.image.shape[:2]
+            x1i, y1i = int(x1), int(y1)
+            x2i, y2i = int(x2), int(y2)
+            if 0 <= x1i < nx and 0 <= y1i < ny and 0 <= x2i < nx and 0 <= y2i < ny:
+                I1 = img_item.image[x1i, y1i]
+                I2 = img_item.image[x2i, y2i]
+                delta_i_line = "\n\N{GREEK CAPITAL LETTER DELTA}I = %.2g" % (I2 - I1)
+            else:
+                delta_i_line = ""
+            self._distance_text.setText(
+                f"{dist_um:.3f} µm\n{dist_px} pix{delta_i_line}"
+            )
             self._distance_text.setVisible(True)
             self._update_lineout()
 

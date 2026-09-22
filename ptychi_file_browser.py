@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import h5py
+import hdf5plugin  # noqa: F401 -- unused, but import registers HDF5 compression filters
 import tifffile
 from PIL import Image
 import time
@@ -529,8 +530,12 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             scan_name = f"S{num:04d}"
             scan_path = self.base_path / scan_name
             if scan_path.exists():
-                self._add_scan_row(scan_path)
-                print(f"Added scan: {scan_name}")
+                if scan_name in self._scan_row_items:
+                    self._refresh_scan_row(scan_path)
+                    print(f"Refreshed scan: {scan_name}")
+                else:
+                    self._add_scan_row(scan_path)
+                    print(f"Added scan: {scan_name}")
             else:
                 missing.append(str(scan_path))
 
@@ -2163,9 +2168,15 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         if file_path.suffix in ('.h5', '.hdf5'):
             with h5py.File(file_path, 'r') as f:
                 if extension == 'recon_NiterXXX_mag.h5':
-                    obj = np.abs(f['object'][0][()]).T
+                    if len(f['object'].shape) == 2:
+                        obj = np.abs(f['object'][()]).T
+                    else:
+                        obj = np.abs(f['object'][0][()]).T
                 else:
-                    obj = np.angle(f['object'][0][()]).T
+                    if len(f['object'].shape) == 2:
+                        obj = np.angle(f['object'][()]).T
+                    else:
+                        obj = np.angle(f['object'][0][()]).T
                 pixel_size_m = float(f['obj_pixel_size_m'][()])
                 if extension == 'recon_NiterXXX_pos.h5' and 'positions_px' in f:
                     positions_px = f['positions_px'][()]
@@ -3348,12 +3359,10 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         """
         Replace an existing scan row with a fresh one, then sort the tree.
         """
-        # Remove existing row if it exists
-        row_item = self._scan_row_items.pop(scan_path.name, None)
+        # Remove existing row (and its tracked state) if it exists
+        row_item = self._scan_row_items.get(scan_path.name)
         if row_item is not None:
-            index = self.treeWidget_fileStructure.indexOfTopLevelItem(row_item)
-            if index != -1:
-                self.treeWidget_fileStructure.takeTopLevelItem(index)
+            self._remove_scan_row(scan_path.name, row_item)
 
         # Add a new row
         self._add_scan_row(scan_path)
