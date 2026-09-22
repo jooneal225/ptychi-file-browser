@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import h5py
-import hdf5plugin  # noqa: F401 -- unused, but import registers HDF5 compression filters
+import hdf5plugin
 import tifffile
 from PIL import Image
 import time
