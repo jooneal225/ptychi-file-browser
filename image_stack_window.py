@@ -22,6 +22,7 @@ from scipy.ndimage import shift as ndi_shift
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QSettings
 
+import fs_budget
 from pg_image_tools import ImagePlotWidget
 
 # Matches pg_image_tools/_compare.py's RESAMPLE_TOLERANCE: skip an
@@ -151,7 +152,7 @@ class ImageStackWindow(QtWidgets.QDialog):
 
         self._build_ui()
 
-        if seed_path is not None and Path(seed_path).exists():
+        if seed_path is not None and fs_budget.exists(Path(seed_path)):
             self._add_paths([Path(seed_path)])
 
         geom = QSettings("temp", "PtychiFileBrowser").value("image_stack_window_geometry")
@@ -369,7 +370,7 @@ class ImageStackWindow(QtWidgets.QDialog):
     def _on_add_clicked(self):
         """Add whatever image is currently selected/displayed in the main window."""
         path = self._browser.file_load_path
-        if path is None or not Path(path).exists():
+        if path is None or not fs_budget.exists(Path(path)):
             QtWidgets.QMessageBox.warning(
                 self, "No image selected",
                 "Select an image in the main window first."
@@ -473,7 +474,7 @@ class ImageStackWindow(QtWidgets.QDialog):
             print(f"[Image Stack] ({i}/{len(scan_nums)}) {scan_name}: looking in '{param_pattern}'...")
             scan_path = self._base_path / scan_name
             candidate = self._resolve_scan_image(scan_path, param_pattern)
-            if candidate is not None and candidate.exists():
+            if candidate is not None and fs_budget.exists(candidate):
                 found.append(candidate)
                 print(f"[Image Stack]   found: {candidate}")
             else:
@@ -493,12 +494,13 @@ class ImageStackWindow(QtWidgets.QDialog):
 
     def _resolve_scan_image(self, scan_path: Path, param_pattern: str):
         """The display file for self._extension within scan_path's param_pattern folder."""
-        if not scan_path.exists():
-            return None
+        # One probe, not two: a missing scan folder has no param folder either,
+        # and get_latest_recon_file raises on a folder that is not there.
         param_folder = scan_path / param_pattern
-        if not param_folder.is_dir():
+        try:
+            latest_recon, _ = self._browser.get_latest_recon_file(param_folder)
+        except OSError:
             return None
-        latest_recon, _ = self._browser.get_latest_recon_file(param_folder)
         if latest_recon is None:
             return None
         return self._browser.resolve_display_path(latest_recon, self._extension)
@@ -1050,6 +1052,7 @@ class ImageStackWindow(QtWidgets.QDialog):
         stack, pixel_size_m = self._build_stack()
         paths = [self._relative_label(entry["path"]) for entry in self._entries]
 
+        fs_budget.charge_write(save_path)
         with h5py.File(save_path, "w") as f:
             dset = f.create_dataset("image_stack", data=stack)
             dset.attrs["pixel_size_m"] = pixel_size_m
@@ -1070,6 +1073,7 @@ class ImageStackWindow(QtWidgets.QDialog):
             scaled = np.zeros_like(stack)
         stack_uint16 = scaled.astype(np.uint16)
 
+        fs_budget.charge_write(save_path)
         tifffile.imwrite(
             save_path, stack_uint16, imagej=True,
             metadata={"pixel_size": pixel_size_m * 1e6},
