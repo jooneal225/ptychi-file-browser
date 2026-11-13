@@ -12,11 +12,21 @@ from PIL import Image
 import time
 import pyqtgraph as pg
 
+import fs_budget
 from scan_watcher_thread import ScanWatcherThread
 from pg_image_tools import ImagePlotWidget
 from image_stack_window import ImageStackWindow
 
 TREE_CACHE_FILENAME = "ptychi_file_browser_tree_cache.csv"
+RECON_LOG_FILENAME = "recon_completed.csv"
+
+# ---- incremental "Add new scans" probing ----
+# We probe S0001-style names one at a time rather than enumerating the base
+# directory: a single-name lookup is one cheap RPC, while a readdir of a few
+# thousand entries costs ~30 tokens. Cost therefore scales with how many scans
+# are NEW, not with how big the directory has grown.
+MAX_NEW_SCANS_PER_PASS = 20
+CONSECUTIVE_MISSES_LIMIT = 3
 
 # ---- log csv (beamline run log found next to the base path) ----
 LOG_CSV_SCAN_COL = "scan"
@@ -116,6 +126,67 @@ GOODNESS_COLORS = {
 RECON_EXISTS_COLOR = QColor(232, 248, 237)
 
 
+# ----------------------------------------------------------------------
+# Pure helpers - no filesystem access, no self. Kept at module level so they
+# are trivially readable and testable on their own.
+# ----------------------------------------------------------------------
+
+def recon_sort_key(p):
+    """
+    Ordering key for recon filenames.
+
+    Raises on a stem carrying neither '_idx' nor 'Niter'; callers that cannot
+    guarantee the convention must catch that.
+    """
+    name = Path(p).stem
+
+    if "_idx" in name:
+        # recon_idx15_Niter20_60 -> 15
+        return int(name.split("_idx")[1].split("_")[0])
+
+    # recon_Niter200 -> 200
+    return int(name.split("Niter")[-1].split("_")[0])
+
+
+def pick_latest_recon(paths):
+    """
+    Choose the 'latest' recon file from a list of paths, BY NAME ONLY.
+
+    Deliberately does no filesystem access. The previous implementation fell
+    back to the newest mtime, which cost one stat() -- one NFS round trip --
+    for every .h5 file in the folder, roughly 30 per param folder across a few
+    thousand scans.
+
+    Priority:
+      1) largest N in the recon_Niter<N> convention (the normal case)
+      2) largest recon_sort_key, which also understands the _idx form
+      3) largest filename, so something sensible is always picked
+    """
+    if not paths:
+        return None
+
+    prefix, suffix = "recon_Niter", ".h5"
+    best_niter, best_path = None, None
+    for p in paths:
+        name = p.name
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        token = name[len(prefix):-len(suffix)].split("_", 1)[0]
+        if token.isdigit():
+            niter = int(token)
+            if best_niter is None or niter > best_niter:
+                best_niter, best_path = niter, p
+
+    if best_path is not None:
+        return best_path
+
+    try:
+        return max(paths, key=recon_sort_key)
+    except (ValueError, IndexError):
+        pass
+
+    return max(paths, key=lambda p: p.name)
+
 
 class RuntableWindow(QtWidgets.QDialog):
     """
@@ -171,6 +242,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._runtable_scatter = None      # pg.ScatterPlotItem, right
         self._runtable_plot_scan = None    # scan string currently plotted
         self._runtable_img_source = None   # (scan, Path, dataset name) cache
+        self._runtable_dir_cache = {}      # folder -> DirEntry list, per refresh
         self._runtable_image_error = None  # unreadable-file message, or None
         self._runtable_scatter_error = None
         self._runtable_total_dp = None     # patterns in the scan, None if unknown
@@ -454,11 +526,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         """
         Show a dialog to add one scan or a range of scans.
         """
-        # Find the maximum scan number from _seen_scans
-        max_scan_num = 0
-        for scan_name in self._seen_scans:
-            if len(scan_name) == 5 and scan_name.startswith("S") and scan_name[1:].isdigit():
-                max_scan_num = max(max_scan_num, int(scan_name[1:]))
+        max_scan_num = self._max_seen_scan_number()
 
         # Create dialog
         dlg = QtWidgets.QDialog(self)
@@ -529,7 +597,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         for num in scan_nums:
             scan_name = f"S{num:04d}"
             scan_path = self.base_path / scan_name
-            if scan_path.exists():
+            if fs_budget.exists(scan_path):
                 if scan_name in self._scan_row_items:
                     self._refresh_scan_row(scan_path)
                     print(f"Refreshed scan: {scan_name}")
@@ -540,6 +608,10 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                 missing.append(str(scan_path))
 
         self.treeWidget_fileStructure.sortItems(0, Qt.AscendingOrder)
+
+        # Keep the cached tree in step with what is now on screen.
+        if len(missing) < len(list(scan_nums)):
+            self.save_tree_to_csv()
 
         if missing:
             QtWidgets.QMessageBox.warning(self, "Scan Not Found",
@@ -574,36 +646,44 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         reanalyze_file = scan_path / "scan_should_be_reanalyzed.txt"
         bad_file = scan_path / "scan_is_bad.txt"
 
+        def write(path, text):
+            fs_budget.charge_write(path)
+            path.write_text(text)
+
+        def remove(path):
+            # One op instead of exists() + unlink(): ask forgiveness rather
+            # than permission, so a missing file costs a single round trip.
+            fs_budget.charge_write(path)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
         if self.radioButton_good.isChecked():
             self.scan_goodness = 'good'
-            good_file.write_text("good\n")
-            if reanalyze_file.exists():
-                reanalyze_file.unlink()
-            if bad_file.exists():
-                bad_file.unlink()
+            write(good_file, "good\n")
+            remove(reanalyze_file)
+            remove(bad_file)
 
         elif self.radioButton_reanalyze.isChecked():
             self.scan_goodness = 'reanalyze'
-            reanalyze_file.write_text("reanalyze\n")
-            if good_file.exists():
-                good_file.unlink()
-            if bad_file.exists():
-                bad_file.unlink()
+            write(reanalyze_file, "reanalyze\n")
+            remove(good_file)
+            remove(bad_file)
 
         elif self.radioButton_bad.isChecked():
             self.scan_goodness = 'bad'
-            bad_file.write_text("bad\n")
-            if good_file.exists():
-                good_file.unlink()
-            if reanalyze_file.exists():
-                reanalyze_file.unlink()
+            write(bad_file, "bad\n")
+            remove(good_file)
+            remove(reanalyze_file)
 
         else:  # unknown
             self.scan_goodness = 'unknown'
-            if good_file.exists():
-                good_file.unlink()
-            if bad_file.exists():
-                bad_file.unlink()
+            remove(good_file)
+            remove(bad_file)
+            # NOTE: pre-existing behaviour - reanalyze_file is deliberately
+            # NOT removed here. Preserved as-is during the rate-limit change;
+            # looks like a bug, but fixing it is a separate decision.
 
 
     def update_scan_goodness_ui(self, goodness: str):
@@ -657,18 +737,31 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     def on_scan_found(self, scan_path: Path):
         print(f"New scan detected: {scan_path.name}")
 
-        if scan_path.name in self._scan_row_items:
-            self._refresh_scan_row(scan_path)   # existing → update in place
-        else:
-            self.refresh_log_csv_for_new_scan()
-            self._add_scan_row(scan_path)       # new → add row
+        # The watcher no longer probes the folder before emitting - that cost
+        # a round trip per log line - so a name in the log that has no folder
+        # (yet) surfaces here as an OSError.
+        try:
+            if scan_path.name in self._scan_row_items:
+                # Quiet: the batch sorts once in on_finished_adding_scans, and
+                # a background update should not steal the user's selection.
+                self._refresh_scan_row_quiet(scan_path)
+            else:
+                self.refresh_log_csv_for_new_scan()
+                self._add_scan_row(scan_path)       # new → add row
+        except OSError as exc:
+            print(f"Skipping {scan_path.name}: {exc}")
 
 
-        
+
     def on_finished_adding_scans(self):
         self.treeWidget_fileStructure.setSortingEnabled(True)
         self.treeWidget_fileStructure.sortByColumn(0, Qt.AscendingOrder)
         self.treeWidget_fileStructure.setSortingEnabled(False)
+
+        # Keep the cache truthful: the watcher used to mutate the tree without
+        # ever writing it back, so the cached tree silently went stale.
+        # Once per batch, not once per scan.
+        self.save_tree_to_csv()
 
 
     def on_param_folder_found(self, param_path: Path):
@@ -728,7 +821,17 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
 
     def find_recent_folder(self, dir_in):
-        it = list(os.scandir(dir_in))
+        """
+        Pick the 'current' param folder inside a scan folder, and list them all.
+
+        Also sets self.scan_goodness from the marker files, which are detected
+        by name out of the same directory read - they cost nothing extra.
+
+        The current folder is the LAST BY NAME, not the newest by mtime. The
+        mtime version needed one stat() per subfolder, i.e. one extra NFS round
+        trip each, and this walk runs over a few thousand scans.
+        """
+        it = fs_budget.scandir(dir_in)
         names = {e.name for e in it}
         self.scan_goodness = (
             'good' if 'scan_is_good.txt' in names else
@@ -737,6 +840,8 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             'unknown'
         )
 
+        # NOT charged: is_dir() on a DirEntry is answered from the readdir
+        # result we already paid for above, so it costs no extra round trip.
         subdirs = [e for e in it if e.is_dir(follow_symlinks=False)]
 
         if not subdirs:
@@ -745,57 +850,26 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             temp = Path(subdirs[0].path)
             return temp, [temp,]
 
-        return Path(max(subdirs, key=lambda e: e.stat().st_mtime).path), [Path(e.path) for e in subdirs]
+        return Path(max(subdirs, key=lambda e: e.name).path), [Path(e.path) for e in subdirs]
     
 
     def get_latest_recon_file(self, dir_in, get_all_instead=False):
         """
         Find the latest recon file in dir_in.
 
-        Priority:
-        1) recon_Niter<integer>*.h5 with largest integer
-        2) most recently modified .h5 file
+        One directory read, no stat() calls - see pick_latest_recon for the
+        selection rule.
         """
-        best_niter = None
-        best_niter_entry = None
-        h5_entries = []
-
-        with os.scandir(dir_in) as it:
-            for e in it:
-                try:
-                    if not e.name.endswith(".h5"):
-                        continue
-
-                    h5_entries.append(e)
-
-                    if e.name.startswith("recon_Niter"):
-                        # fast-path integer parse
-                        suffix = e.name[11:-3]  # after "recon_Niter", before ".h5"
-                        token = suffix.split("_", 1)[0]
-                        if token.isdigit():
-                            niter = int(token)
-                            if best_niter is None or niter > best_niter:
-                                best_niter = niter
-                                best_niter_entry = e
-                except:
-                    continue
+        h5_paths = [Path(e.path) for e in fs_budget.scandir(dir_in)
+                    if e.name.endswith(".h5")]
 
         if get_all_instead:
-            return [Path(e.path) for e in h5_entries]
+            return h5_paths
 
-        # Prefer largest Niter
-        if best_niter_entry is not None:
-            return Path(best_niter_entry.path), [Path(e.path) for e in h5_entries]
-
-        if not h5_entries:
+        if not h5_paths:
             return None, None
 
-        # Only now do we touch stat()
-        if len(h5_entries) == 1:
-            temp = Path(h5_entries[0].path)
-            return temp, [temp,]
-
-        return Path(max(h5_entries, key=lambda e: e.stat().st_mtime).path), [Path(e.path) for e in h5_entries]
+        return pick_latest_recon(h5_paths), h5_paths
 
 
 
@@ -818,10 +892,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         csv_name = f"runtable_full_{parent.name}.csv"
         csv_path = parent / csv_name
 
-        if not csv_path.exists():
+        if not fs_budget.exists(csv_path):
             return None
 
         try:
+            fs_budget.charge_data_read(csv_path)
             df = pd.read_csv(csv_path)
         except Exception as exc:
             print(f"Failed to load runtable: {exc}")
@@ -862,12 +937,12 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         # --- filesystem fallback ---
         base_dir = self.base_path.parent
         run_dir = base_dir / f"ptycho/{scan_num:03d}"
-        if not run_dir.is_dir():
+        if not fs_budget.is_dir(run_dir):
             run_dir = base_dir / f"ptycho/S{scan_num:04d}"
-        if not run_dir.is_dir():
+        if not fs_budget.is_dir(run_dir):
             return None
 
-        hits = list(run_dir.glob("*00001.h5"))
+        hits = fs_budget.glob(run_dir, "*00001.h5")
         if not hits:
             return None
 
@@ -903,7 +978,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     def _log_csv_stat_tuple(self, path: Path):
         """(mtime, size) of the csv, or None if it cannot be stat'ed."""
         try:
-            st = os.stat(path)
+            st = fs_budget.stat(path)
         except OSError:
             return None
         return (st.st_mtime, st.st_size)
@@ -928,14 +1003,14 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         remembered_csv = settings.value("log_csv_path")
         if remembered_base == str(self.base_path) and remembered_csv:
             remembered_csv = Path(remembered_csv)
-            if remembered_csv.exists():
+            if fs_budget.exists(remembered_csv):
                 return remembered_csv
 
         try:
             # Skip the bad list we write ourselves - it has a 'scan' column
             # too, so it would otherwise pass as a log csv
             candidates = sorted(
-                p for p in self.base_path.parent.glob("*.csv")
+                p for p in fs_budget.glob(self.base_path.parent, "*.csv")
                 if p.name not in (SCAN_BAD_LIST_FILENAME, TREE_CACHE_FILENAME)
             )
         except OSError as exc:
@@ -1036,6 +1111,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             return False
 
         try:
+            fs_budget.charge_data_read(csv_path)
             df = pd.read_csv(csv_path)
         except Exception as exc:
             print(f"Failed to load log csv: {exc}")
@@ -1088,10 +1164,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self._log_bad_by_scan = {}
 
         path = self.scan_bad_list_path
-        if path is None or not path.exists():
+        if path is None or not fs_budget.exists(path):
             return
 
         try:
+            fs_budget.charge_data_read(path)
             df = pd.read_csv(path)
         except Exception as exc:
             print(f"Failed to load {SCAN_BAD_LIST_FILENAME}: {exc}")
@@ -1158,6 +1235,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         ]
 
         try:
+            fs_budget.charge_write(path)
             pd.DataFrame(rows, columns=[SCAN_BAD_SCAN_COL, SCAN_BAD_FLAG_COL]).to_csv(
                 path, index=False
             )
@@ -1188,6 +1266,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         viewer_open = self.runtable_window is not None and self.runtable_window.isVisible()
 
         try:
+            fs_budget.charge_data_read(self.log_csv_path)
             if viewer_open:
                 df = pd.read_csv(self.log_csv_path)
             else:
@@ -1216,6 +1295,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             return
 
         try:
+            fs_budget.charge_data_read(self.log_csv_path)
             df = pd.read_csv(self.log_csv_path)
         except Exception as exc:
             print(f"Failed to reload log csv: {exc}")
@@ -1780,15 +1860,21 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             self._clear_runtable_plots()
             return
 
+        # Both panes resolve files out of the same six folders; share one
+        # directory read between them for this refresh.
+        self._clear_runtable_dir_cache()
         self._update_runtable_image(scan_str)
         self._update_runtable_scatter(scan_str)
+        self._clear_runtable_dir_cache()
 
 
     def _on_runtable_slice_changed(self, _value):
         """Re-read just the image; the cached source keeps this off the network."""
         if self._runtable_updating or self._runtable_plot_scan is None:
             return
+        self._clear_runtable_dir_cache()
         self._update_runtable_image(self._runtable_plot_scan)
+        self._clear_runtable_dir_cache()
 
 
     def _set_runtable_slice_range(self, n_slices, value):
@@ -1922,25 +2008,52 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         ends_with = source.get("ends_with")
         skip = source.get("skip_ends_with")
 
-        def wanted(p):
-            if skip is not None and p.name.endswith(skip):
+        def wanted(entry):
+            if skip is not None and entry.name.endswith(skip):
                 return False
-            if ends_with is not None and not p.name.endswith(ends_with):
+            if ends_with is not None and not entry.name.endswith(ends_with):
                 return False
-            if contains is not None and contains not in p.name:
+            if contains is not None and contains not in entry.name:
                 return False
-            return p.is_file()
+            # NOT charged: is_file() comes from the readdir we already paid for
+            return entry.is_file()
 
         try:
-            hits = [p for p in folder.iterdir() if wanted(p)]
+            hits = [e for e in self._runtable_list_dir(folder) if wanted(e)]
 
             if not hits:
                 return None, 0
             if source["pick"] == "newest":
-                return max(hits, key=lambda p: p.stat().st_mtime), len(hits)
-            return sorted(hits)[0], len(hits)
+                # One charged stat per candidate. DirEntry.stat() would be free
+                # on Windows but is a real round trip on Linux/NFS, so we pay
+                # for it openly rather than relying on the platform.
+                newest = max(hits, key=lambda e: fs_budget.stat(e.path).st_mtime)
+                return Path(newest.path), len(hits)
+            return sorted(Path(e.path) for e in hits)[0], len(hits)
         except OSError:
             return None, 0
+
+
+    def _runtable_list_dir(self, folder):
+        """
+        One directory read per folder, per plot refresh.
+
+        RUNTABLE_IMAGE_SOURCES and RUNTABLE_SCATTER_SOURCES name the SAME six
+        folders, so without this cache a single refresh enumerated each of
+        them twice - once for the image pane and once for the scatter pane.
+        """
+        key = str(folder)
+        if key not in self._runtable_dir_cache:
+            try:
+                self._runtable_dir_cache[key] = fs_budget.scandir(folder)
+            except OSError:
+                self._runtable_dir_cache[key] = []
+        return self._runtable_dir_cache[key]
+
+
+    def _clear_runtable_dir_cache(self):
+        """Drop the per-refresh listing cache so the next refresh sees disk."""
+        self._runtable_dir_cache = {}
 
 
     @staticmethod
@@ -1959,6 +2072,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         and stays None for the ordinary misses the caller expects to walk past.
         """
         try:
+            fs_budget.charge_data_read(path)
             f = h5py.File(path, "r")
         except OSError as exc:
             return None, f"cannot open {path.name}: {exc}"
@@ -2052,6 +2166,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         names = (source["xy"],) if "xy" in source else (source["x"], source["y"])
 
         try:
+            fs_budget.charge_data_read(path)
             f = h5py.File(path, "r")
         except OSError as exc:
             return None, f"cannot open {path.name}: {exc}"
@@ -2166,6 +2281,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         positions_px = None
 
         if file_path.suffix in ('.h5', '.hdf5'):
+            fs_budget.charge_data_read(file_path)
             with h5py.File(file_path, 'r') as f:
                 if extension == 'recon_NiterXXX_mag.h5':
                     if len(f['object'].shape) == 2:
@@ -2183,6 +2299,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         elif file_path.suffix in ('.tiff',):
             pixel_size_m = None
+            fs_budget.charge_data_read(file_path)
             with tifffile.TiffFile(file_path) as tif:
                 obj = tif.asarray()
                 if 'pixel_size' in tif.imagej_metadata.keys():
@@ -2199,6 +2316,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         elif file_path.suffix in ('.png',):
             pixel_size_m = None
+            fs_budget.charge_data_read(file_path)
             obj = Image.open(file_path).convert("L")  # L = grayscale
             obj = np.array(obj, dtype=np.float32).T
 
@@ -2225,7 +2343,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         self.file_load_path = self.resolve_display_path(file_path, extension)
 
-        if not self.file_load_path.exists():
+        if not fs_budget.exists(self.file_load_path):
             return None
 
         obj, pixel_size_m, positions_px = self.read_image_and_pixel_size(self.file_load_path, extension)
@@ -2271,7 +2389,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
         if not isinstance(file_path, Path):
             param_path = item.data(1, Qt.UserRole)
-            if not isinstance(param_path, Path) or not param_path.exists():
+            if not isinstance(param_path, Path) or not fs_budget.exists(param_path):
                 return
             # Synthetic path: parent = param_path; stem is irrelevant for tiff/png choices
             file_path = param_path / "_"
@@ -2392,14 +2510,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
 
 
     def _recon_sort_key(self, p: Path):
-        name = p.stem
-
-        if "_idx" in name:
-            # recon_idx15_Niter20_60 → 15
-            return int(name.split("_idx")[1].split("_")[0])
-
-        # recon_Niter200 → 200
-        return int(name.split("Niter")[-1].split("_")[0])
+        return recon_sort_key(p)
 
 
     def _switch_param_folder(self, row_item, scan_name, param_path):
@@ -2548,40 +2659,304 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
 
     def iter_scan_folders(self):
-        if self.base_path is None or not self.base_path.exists():
+        if self.base_path is None or not fs_budget.exists(self.base_path):
             return
-        
-        with os.scandir(self.base_path) as it:
-            for entry in it:
 
-                name = entry.name
-                if len(name) == 5 and name.startswith("S") and name[1:].isdigit():
-                    yield Path(entry.path)
+        for entry in fs_budget.scandir(self.base_path):
+            name = entry.name
+            if len(name) == 5 and name.startswith("S") and name[1:].isdigit():
+                yield Path(entry.path)
 
 
     def on_populate_tree_clicked(self):
         """
-        Handler for pushButton_populateTree. If a tree cache already exists
-        for base_path, ask the user whether to load it (fast) or re-walk
-        the filesystem (slow, but authoritative).
+        Handler for pushButton_populateTree.
+
+        Offers four ways to fill the tree, cheapest first. The full walk is
+        last and guarded by its own warning, because on an NFS mount it is the
+        only one that costs minutes rather than seconds.
         """
-        if self.base_path is not None and (self.base_path / TREE_CACHE_FILENAME).exists():
-            dlg = QtWidgets.QMessageBox(self)
-            dlg.setWindowTitle("Populate Tree")
-            dlg.setText("Do you want to load the cached files, or read the file structure directly?")
-            load_btn = dlg.addButton("Load cached files", QtWidgets.QMessageBox.AcceptRole)
-            read_btn = dlg.addButton("Read file structure", QtWidgets.QMessageBox.DestructiveRole)
-            dlg.setDefaultButton(load_btn)
-            dlg.exec_()
+        has_cache = (self.base_path is not None
+                     and fs_budget.exists(self.base_path / TREE_CACHE_FILENAME))
 
-            clicked = dlg.clickedButton()
-            if clicked is load_btn:
-                self.load_tree_from_csv()
-                return
-            elif clicked is not read_btn:
-                return  # dialog dismissed without a choice
+        # The incremental options need existing in-memory rows to build on.
+        has_rows = bool(self._seen_scans)
 
-        self.populate_tree_with_scans()
+        if not has_cache and not has_rows:
+            # Nothing to be incremental about - only the full walk makes sense.
+            if self._confirm_full_walk():
+                self.populate_tree_with_scans()
+            return
+
+        dlg = QtWidgets.QMessageBox(self)
+        dlg.setWindowTitle("Populate Tree")
+        dlg.setText("How do you want to fill the tree?")
+        dlg.setInformativeText(
+            "Loading the cache and the two incremental options are fast.\n"
+            "Reading the full file structure re-reads every scan folder on "
+            "the file server and is slow."
+        )
+
+        load_btn = new_btn = log_btn = None
+        if has_cache:
+            load_btn = dlg.addButton("Load cached files",
+                                     QtWidgets.QMessageBox.AcceptRole)
+        if has_rows:
+            new_btn = dlg.addButton("Add new scans",
+                                    QtWidgets.QMessageBox.ActionRole)
+            log_btn = dlg.addButton("Refresh from reconstruction log",
+                                    QtWidgets.QMessageBox.ActionRole)
+        read_btn = dlg.addButton("Read full file structure",
+                                 QtWidgets.QMessageBox.DestructiveRole)
+        dlg.addButton(QtWidgets.QMessageBox.Cancel)
+
+        dlg.setDefaultButton(load_btn if load_btn is not None else read_btn)
+        dlg.exec_()
+        clicked = dlg.clickedButton()
+
+        if clicked is load_btn and load_btn is not None:
+            self.load_tree_from_csv()
+        elif clicked is new_btn and new_btn is not None:
+            self.add_new_scans()
+        elif clicked is log_btn and log_btn is not None:
+            self.refresh_from_recon_log()
+        elif clicked is read_btn:
+            if self._confirm_full_walk():
+                self.populate_tree_with_scans()
+        else:
+            return  # Cancel, or dismissed without a choice
+
+
+    def _confirm_full_walk(self):
+        """
+        Second confirmation before the expensive full walk.
+
+        Returns True if the user wants to go ahead.
+        """
+        answer = QtWidgets.QMessageBox.warning(
+            self,
+            "Scan the full tree?",
+            "Scanning the full tree can be very slow.\n\n"
+            f"Estimated time: about {fs_budget.ESTIMATED_FULL_WALK_MINUTES} minutes "
+            f"at the current limit of {fs_budget.RATE_OPS_PER_SEC:.0f} "
+            "filesystem operations per second.\n\n"
+            "This reads every scan folder on the file server. Proceed?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        return answer == QtWidgets.QMessageBox.Yes
+
+
+    def _max_seen_scan_number(self):
+        """Largest S#### number currently in the tree, or 0 if there are none."""
+        max_scan_num = 0
+        for scan_name in self._seen_scans:
+            if len(scan_name) == 5 and scan_name.startswith("S") and scan_name[1:].isdigit():
+                max_scan_num = max(max_scan_num, int(scan_name[1:]))
+        return max_scan_num
+
+
+    def add_new_scans(self):
+        """
+        Add scan folders numbered above the highest one already in the tree.
+
+        Probes consecutive names one at a time rather than enumerating the
+        base directory: a single-name lookup is one cheap round trip, whereas
+        a readdir of a few thousand entries costs ~30. Cost therefore scales
+        with how many scans are new, not with how large the directory is.
+
+        Stops after CONSECUTIVE_MISSES_LIMIT misses in a row, or once
+        MAX_NEW_SCANS_PER_PASS scans have been added.
+        """
+        if self.base_path is None:
+            return
+
+        start_num = self._max_seen_scan_number()
+        added, misses, num = [], 0, start_num
+        hit_cap = False
+
+        fs_budget.BUDGET.reset_cancel()
+        self.treeWidget_fileStructure.setUpdatesEnabled(False)
+        try:
+            while misses < CONSECUTIVE_MISSES_LIMIT:
+                if len(added) >= MAX_NEW_SCANS_PER_PASS:
+                    hit_cap = True
+                    break
+
+                num += 1
+                scan_name = f"S{num:04d}"
+                scan_path = self.base_path / scan_name
+
+                if not fs_budget.is_dir(scan_path):
+                    misses += 1
+                    continue
+
+                misses = 0
+                if scan_name in self._scan_row_items:
+                    continue  # already present; nothing to add
+
+                if not added:
+                    # First new row of this pass - make sure sample names are
+                    # current before we read them.
+                    self.refresh_log_csv_for_new_scan()
+
+                self._add_scan_row(scan_path)
+                added.append(scan_name)
+                print(f"Added scan: {scan_name}")
+        except fs_budget.FsBudgetCancelled:
+            print("Add new scans cancelled.")
+        finally:
+            self.treeWidget_fileStructure.setUpdatesEnabled(True)
+
+        self.treeWidget_fileStructure.sortItems(0, Qt.AscendingOrder)
+
+        if added:
+            self.save_tree_to_csv()
+            self.save_scan_bad_list()
+
+        self._report_add_new_scans(added, hit_cap, start_num)
+
+
+    def _report_add_new_scans(self, added, hit_cap, start_num):
+        """Tell the user what happened, and why the search stopped."""
+        if not added:
+            QtWidgets.QMessageBox.information(
+                self, "No new scans",
+                f"No new scans found after S{start_num:04d}.",
+            )
+            return
+
+        span = added[0] if len(added) == 1 else f"{added[0]}-{added[-1]}"
+        if hit_cap:
+            tail = (f"\n\nStopped at the {MAX_NEW_SCANS_PER_PASS}-scan limit for one "
+                    "pass - run it again to continue.")
+        else:
+            tail = "\n\nNo further scans found."
+
+        QtWidgets.QMessageBox.information(
+            self, "Added new scans",
+            f"Added {len(added)} new scan(s) ({span})." + tail,
+        )
+
+
+    def refresh_from_recon_log(self):
+        """
+        Refresh scans listed in recon_completed.csv, newest entry first.
+
+        Stops at the first scan that turns out to have no recon files beyond
+        the ones already in the tree. That early exit is intentional: the log
+        is append-ordered, so once a scan has nothing new, the older ones
+        below it are assumed to be up to date too. A completed reconstruction
+        that produced no new file therefore halts the sweep - that is the
+        requested behaviour, not a bug.
+
+        Each scan folder is read exactly once: the row is rebuilt and the
+        before/after recon sets are compared, rather than scanning once to
+        diff and again to rebuild.
+        """
+        if self.base_path is None:
+            return
+
+        log_path = self.base_path / RECON_LOG_FILENAME
+        if not fs_budget.exists(log_path):
+            QtWidgets.QMessageBox.warning(
+                self, "No reconstruction log found",
+                f"No reconstruction log found at:\n{log_path}\n\n"
+                "This file is written by the reconstruction script, one scan "
+                "name per line. Without it, use 'Add new scans' or a full read "
+                "of the file structure instead.",
+            )
+            return
+
+        try:
+            fs_budget.charge_data_read(log_path)
+            with open(log_path, "r") as f:
+                lines = f.read().splitlines()
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self, "Could not read reconstruction log", str(exc))
+            return
+
+        # One entry per completed reconstruction, so a scan with several param
+        # folders appears several times. De-duplicate, newest first.
+        ordered = []
+        seen = set()
+        for line in reversed(lines):
+            scan_id = line.strip().split(",")[0].strip()
+            if scan_id and scan_id not in seen:
+                seen.add(scan_id)
+                ordered.append(scan_id)
+
+        if not ordered:
+            QtWidgets.QMessageBox.information(
+                self, "Reconstruction log is empty",
+                f"No scan names found in:\n{log_path}",
+            )
+            return
+
+        checked, updated, skipped, stopped_early = 0, [], 0, False
+
+        fs_budget.BUDGET.reset_cancel()
+        self.treeWidget_fileStructure.setUpdatesEnabled(False)
+        try:
+            for scan_id in ordered:
+                scan_path = self.base_path / scan_id
+                checked += 1
+
+                # Snapshot what we already know BEFORE rebuilding the row,
+                # because rebuilding discards this scan's bookkeeping.
+                known = self._known_recon_files(scan_id)
+
+                # Read the scan ONCE. Diffing first and then rebuilding would
+                # enumerate the same folders twice.
+                try:
+                    if scan_id in self._scan_row_items:
+                        self._refresh_scan_row_quiet(scan_path)
+                    else:
+                        self.refresh_log_csv_for_new_scan()
+                        self._add_scan_row(scan_path)
+                except OSError as exc:
+                    # Logged but gone, or unreadable. Not the same thing as
+                    # "nothing new", so do not stop the sweep on it.
+                    skipped += 1
+                    print(f"Skipping {scan_id}: {exc}")
+                    continue
+
+                if self._known_recon_files(scan_id) <= known:
+                    stopped_early = True
+                    break
+
+                updated.append(scan_id)
+                print(f"Refreshed from recon log: {scan_id}")
+        except fs_budget.FsBudgetCancelled:
+            print("Refresh from reconstruction log cancelled.")
+        finally:
+            self.treeWidget_fileStructure.setUpdatesEnabled(True)
+
+        self.treeWidget_fileStructure.sortItems(0, Qt.AscendingOrder)
+
+        if updated:
+            self.save_tree_to_csv()
+            self.save_scan_bad_list()
+
+        reason = ("Stopped at the first scan with no new files."
+                  if stopped_early else
+                  "Reached the end of the reconstruction log.")
+        skipped_note = (f"\nSkipped {skipped} unreadable scan folder(s)."
+                        if skipped else "")
+        QtWidgets.QMessageBox.information(
+            self, "Refresh from reconstruction log",
+            f"Checked {checked} scan(s), updated {len(updated)}."
+            f"{skipped_note}\n\n{reason}",
+        )
+
+
+    def _known_recon_files(self, scan_name: str):
+        """Every recon file the tree currently knows about for one scan."""
+        known = set()
+        for recon_set in self._seen_recon_files.get(scan_name, {}).values():
+            known |= recon_set
+        return known
 
 
     def populate_tree_with_scans(self):
@@ -2597,26 +2972,56 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.load_log_csv()
 
         t0 = time.time()
+        fs_budget.BUDGET.reset_cancel()
+        fs_budget.BUDGET.reset_counters()
+
+        # This walk is rate limited to protect the file server, so it runs for
+        # minutes. Give it a real progress dialog with a working Cancel rather
+        # than a window that looks hung.
+        progress = QtWidgets.QProgressDialog(
+            "Reading scan folders...", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Scanning the full tree")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        cancelled = False
+        count = 0
+
         self.treeWidget_fileStructure.setUpdatesEnabled(False)
-        for i, scan_path in enumerate(self.iter_scan_folders()):
-            if ((i+1) % 30 == 0):
-                self.treeWidget_fileStructure.setUpdatesEnabled(True)
-            if i == 5:
-                self.treeWidget_fileStructure.resizeColumnToContents(0)
-                self.treeWidget_fileStructure.resizeColumnToContents(2)
+        try:
+            for i, scan_path in enumerate(self.iter_scan_folders()):
+                if ((i+1) % 30 == 0):
+                    self.treeWidget_fileStructure.setUpdatesEnabled(True)
+                if i == 5:
+                    self.treeWidget_fileStructure.resizeColumnToContents(0)
+                    self.treeWidget_fileStructure.resizeColumnToContents(2)
 
-            print(f"Processing {scan_path.name}")
+                if progress.wasCanceled():
+                    # Makes the next rate-limited call raise, so we stop even
+                    # if we are mid-way through one scan's folders.
+                    fs_budget.BUDGET.cancel()
+                    cancelled = True
+                    break
 
-            self._add_scan_row(scan_path)
+                print(f"Processing {scan_path.name}")
 
-            # Keep UI responsive
-            if ((i+1) % 30 == 0):
-                QtWidgets.QApplication.processEvents()
+                self._add_scan_row(scan_path)
+                count += 1
 
-            if (i+1) % 30 == 0:
-                self.treeWidget_fileStructure.setUpdatesEnabled(False)
+                # Keep UI responsive
+                if ((i+1) % 30 == 0):
+                    progress.setLabelText(
+                        f"Read {count} scan folders...\n"
+                        f"{fs_budget.BUDGET.summary()}")
+                    QtWidgets.QApplication.processEvents()
+                    self.treeWidget_fileStructure.setUpdatesEnabled(False)
+        except fs_budget.FsBudgetCancelled:
+            cancelled = True
+        finally:
+            self.treeWidget_fileStructure.setUpdatesEnabled(True)
+            progress.close()
 
-        self.treeWidget_fileStructure.setUpdatesEnabled(True)
         QtWidgets.QApplication.processEvents()
 
         self.treeWidget_fileStructure.resizeColumnToContents(0)
@@ -2625,6 +3030,15 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         self.save_tree_to_csv()
         self.save_scan_bad_list()
         print(time.time() - t0, 's')
+        print(fs_budget.BUDGET.summary())
+
+        if cancelled:
+            QtWidgets.QMessageBox.information(
+                self, "Scan cancelled",
+                f"Stopped after reading {count} scan folder(s).\n\n"
+                "The partial tree has been saved to the cache; use "
+                "'Add new scans' or run the full read again to continue.",
+            )
 
         self._set_scan_watcher_ui('stopped')
 
@@ -2706,11 +3120,13 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
                     })
 
         csv_path = self.base_path / TREE_CACHE_FILENAME
-        pd.DataFrame(rows, columns=[
+        frame = pd.DataFrame(rows, columns=[
             'scan_name', 'scan_goodness', 'sample_name',
             'param_folder', 'is_current_param',
             'recon_file', 'is_current_recon',
-        ]).to_csv(csv_path, index=False)
+        ])
+        fs_budget.charge_write(csv_path)
+        frame.to_csv(csv_path, index=False)
         print(f"Saved tree cache to {csv_path}")
 
     def load_tree_from_csv(self):
@@ -2722,7 +3138,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             return
 
         csv_path = self.base_path / TREE_CACHE_FILENAME
-        if not csv_path.exists():
+        if not fs_budget.exists(csv_path):
             QtWidgets.QMessageBox.warning(
                 self, "No tree cache found",
                 f"No tree cache file found at:\n{csv_path}\n\nUse 'Populate tree' or 'Save Tree' first.",
@@ -2730,6 +3146,7 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             return
 
         try:
+            fs_budget.charge_data_read(csv_path)
             df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Failed to load tree cache", str(exc))
@@ -2867,12 +3284,17 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         The highest-iteration recon_NiterN.h5 is kept; all others and their
         derived files (comboBox items containing XXX but not recon_Niter) are deleted.
         """
-        # Step 1: find all recon_NiterN.h5 files and their iteration numbers
+        # Step 1: find all recon_NiterN.h5 files and their iteration numbers.
+        # One directory read serves both steps below.
+        existing_names = {e.name for e in fs_budget.scandir(param_path)}
+
         niter_map = {}  # int -> Path
-        for f in param_path.glob("recon_Niter*.h5"):
-            token = f.stem[len("recon_Niter"):].split("_", 1)[0]
+        for name in existing_names:
+            if not (name.startswith("recon_Niter") and name.endswith(".h5")):
+                continue
+            token = name[len("recon_Niter"):-len(".h5")].split("_", 1)[0]
             if token.isdigit():
-                niter_map[int(token)] = f
+                niter_map[int(token)] = param_path / name
 
         if not niter_map:
             return []
@@ -2889,9 +3311,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             if "XXX" not in option:
                 continue
             for n in niters_to_delete:
-                full_path = param_path / option.replace("XXX", str(n))
-                if full_path.exists():
-                    delete_paths.append(full_path)
+                candidate = option.replace("XXX", str(n))
+                # Membership test against the listing we already paid for,
+                # rather than one exists() per option per iteration.
+                if candidate in existing_names:
+                    delete_paths.append(param_path / candidate)
 
         return delete_paths
 
@@ -2904,8 +3328,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         if not self._confirm_delete(f"Delete files:\n{param_path}", delete_paths):
             return
         for p in delete_paths:
-            if p.exists():
+            fs_budget.charge_write(p)
+            try:
                 p.unlink()
+            except FileNotFoundError:
+                pass
         # Remove deleted recon files from tracker
         deleted_names = {p for p in delete_paths}
         current = self._seen_recon_files[scan_name].get(param_path.name, set())
@@ -2916,11 +3343,12 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         all_paths = []
         for n in range(min(first_num, last_num), max(first_num, last_num) + 1):
             scan_path = self.base_path / f"S{n:04d}"
-            if not scan_path.exists():
-                continue
+            # One directory read; a missing or unreadable folder just raises,
+            # which saves the separate exists() check.
             try:
-                subdirs = sorted(d for d in scan_path.iterdir() if d.is_dir())
-            except PermissionError:
+                subdirs = sorted(Path(e.path)
+                                 for e in fs_budget.scandir(scan_path) if e.is_dir())
+            except OSError:
                 continue
             for param_path in subdirs:
                 all_paths.extend(self._build_intermediate_delete_list(param_path))
@@ -2937,18 +3365,19 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         plan = []
         for n in range(min(first_num, last_num), max(first_num, last_num) + 1):
             scan_path = self.base_path / f"S{n:04d}"
-            if not scan_path.is_dir():
-                continue
+            # One directory read; a missing or unreadable folder just raises.
             try:
-                subdirs = sorted(d for d in scan_path.iterdir() if d.is_dir())
-            except PermissionError:
+                subdirs = sorted(Path(e.path)
+                                 for e in fs_budget.scandir(scan_path) if e.is_dir())
+            except OSError:
                 continue
 
             empty_params = []
             for param_path in subdirs:
                 try:
-                    has_recon = any(param_path.glob("*.h5"))
-                except PermissionError:
+                    has_recon = any(e.name.endswith(".h5")
+                                    for e in fs_budget.scandir(param_path))
+                except OSError:
                     continue
                 if not has_recon:
                     empty_params.append(param_path)
@@ -2980,16 +3409,24 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             scan_name = entry['scan_name']
 
             for param_path in entry['param_paths']:
-                if param_path.exists():
+                # One op instead of exists() + rmtree(). Real errors still
+                # propagate; only "already gone" is swallowed.
+                fs_budget.charge_write(param_path)
+                try:
                     shutil.rmtree(param_path)
+                except FileNotFoundError:
+                    pass
                 if scan_name in self._seen_param_folders:
                     self._seen_param_folders[scan_name].discard(param_path)
                 if scan_name in self._seen_recon_files:
                     self._seen_recon_files[scan_name].pop(param_path.name, None)
 
             if entry['delete_scan']:
-                if entry['scan_path'].exists():
+                fs_budget.charge_write(entry['scan_path'])
+                try:
                     shutil.rmtree(entry['scan_path'])
+                except FileNotFoundError:
+                    pass
                 row_item = self._scan_row_items.get(scan_name)
                 if row_item is not None:
                     self._remove_scan_row(scan_name, row_item)
@@ -3016,11 +3453,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         plan = []
         for n in range(min(first_num, last_num), max(first_num, last_num) + 1):
             scan_path = self.base_path / f"S{n:04d}"
-            if not scan_path.is_dir():
-                continue
+            # One directory read; a missing or unreadable folder just raises.
             try:
-                subdirs = sorted(d for d in scan_path.iterdir() if d.is_dir())
-            except PermissionError:
+                subdirs = sorted(Path(e.path)
+                                 for e in fs_budget.scandir(scan_path) if e.is_dir())
+            except OSError:
                 continue
 
             matches = [d for d in subdirs if d.name == pattern]
@@ -3052,16 +3489,24 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
             scan_name = entry['scan_name']
 
             for param_path in entry['param_paths']:
-                if param_path.exists():
+                # One op instead of exists() + rmtree(). Real errors still
+                # propagate; only "already gone" is swallowed.
+                fs_budget.charge_write(param_path)
+                try:
                     shutil.rmtree(param_path)
+                except FileNotFoundError:
+                    pass
                 if scan_name in self._seen_param_folders:
                     self._seen_param_folders[scan_name].discard(param_path)
                 if scan_name in self._seen_recon_files:
                     self._seen_recon_files[scan_name].pop(param_path.name, None)
 
             if entry['delete_scan']:
-                if entry['scan_path'].exists():
+                fs_budget.charge_write(entry['scan_path'])
+                try:
                     shutil.rmtree(entry['scan_path'])
+                except FileNotFoundError:
+                    pass
                 row_item = self._scan_row_items.get(scan_name)
                 if row_item is not None:
                     self._remove_scan_row(scan_name, row_item)
@@ -3080,8 +3525,11 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     def _apply_intermediate_deletions(self, first_num: int, last_num: int, all_paths: list):
         """Unlink every collected intermediate recon file and update the trackers."""
         for p in all_paths:
-            if p.exists():
+            fs_budget.charge_write(p)
+            try:
                 p.unlink()
+            except FileNotFoundError:
+                pass
 
         deleted_set = set(all_paths)
         lo, hi = min(first_num, last_num), max(first_num, last_num)
@@ -3320,12 +3768,14 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
     def _delete_scan_folder(self, scan_name: str, scan_path: Path, item: QtWidgets.QTreeWidgetItem):
         if not self._confirm_delete(f"Delete files:\n{scan_path.parent}", [scan_path]):
             return
+        fs_budget.charge_write(scan_path)
         shutil.rmtree(scan_path)
         self._remove_scan_row(scan_name, item)
 
     def _delete_param_folder(self, scan_name: str, param_path: Path, item: QtWidgets.QTreeWidgetItem):
         if not self._confirm_delete(f"Delete files:\n{param_path.parent}", [param_path]):
             return
+        fs_budget.charge_write(param_path)
         shutil.rmtree(param_path)
         # Clean up trackers
         self._seen_param_folders[scan_name].discard(param_path)
@@ -3355,17 +3805,25 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         # Col 2: recon files
         self._seen_recon_files.pop(scan_name, None)
 
-    def _refresh_scan_row(self, scan_path: Path):
+    def _refresh_scan_row_quiet(self, scan_path: Path):
         """
-        Replace an existing scan row with a fresh one, then sort the tree.
+        Rebuild one scan row, leaving the sort order and selection alone.
+
+        This is the body a bulk loop wants: sorting the whole tree and
+        stealing the selection once per scan is both slow and jarring, so
+        callers that refresh many rows sort once when they are done.
         """
-        # Remove existing row (and its tracked state) if it exists
         row_item = self._scan_row_items.get(scan_path.name)
         if row_item is not None:
             self._remove_scan_row(scan_path.name, row_item)
 
-        # Add a new row
         self._add_scan_row(scan_path)
+
+    def _refresh_scan_row(self, scan_path: Path):
+        """
+        Replace an existing scan row with a fresh one, then sort and select it.
+        """
+        self._refresh_scan_row_quiet(scan_path)
 
         # Optionally sort by scan name (or keep your custom order)
         self.treeWidget_fileStructure.sortItems(0, Qt.AscendingOrder)
@@ -3459,17 +3917,12 @@ class PtychiReconBrowser(QtWidgets.QMainWindow):
         Validate and set the base path.
         This is the single source of truth for updating self.base_path.
         """
-        path = path.expanduser().resolve()
+        # abspath, not resolve(): resolve() walks the path on disk to follow
+        # symlinks, which is an extra round trip we do not need here.
+        path = Path(os.path.abspath(path.expanduser()))
 
-        if not path.exists():
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Invalid path",
-                f"Path does not exist:\n{path}",
-            )
-            return False
-
-        if not path.is_dir():
+        # One is_dir() covers both checks - a missing path is not a directory.
+        if not fs_budget.is_dir(path):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Invalid path",
